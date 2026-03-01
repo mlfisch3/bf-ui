@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
+import uuid
 from typing import Any
 
 import pandas as pd
@@ -13,7 +15,37 @@ from ui.github_client import GithubClient, GithubConfig
 from ui.models import thread_id_for, utc_now
 
 
-st.set_page_config(page_title="BladeForums View Tracker", layout="wide")
+st.set_page_config(page_title="BladeForums View Tracker", layout="wide", initial_sidebar_state="collapsed")
+
+
+def widget_key(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def handle_error(exc: Exception, github: GithubClient | None) -> None:
+    st.error("Unexpected error. Details are shown below.")
+    st.exception(exc)
+    if not github:
+        return
+    try:
+        log_ui_error(github, exc)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def log_ui_error(github: GithubClient, exc: Exception) -> None:
+    payload = {
+        "ts": utc_now(),
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+    try:
+        existing, sha = github.get_file("data/ui_errors.json")
+    except Exception:  # noqa: BLE001
+        existing, sha = {"errors": []}, None
+    existing.setdefault("errors", [])
+    existing["errors"].append(payload)
+    github.put_file("data/ui_errors.json", existing, "Log UI error", sha)
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -69,25 +101,26 @@ def main() -> None:
     source, github, repo = build_clients()
     read_only = github is None
 
-    config = load_config(source)
-    threads_payload = load_threads(source)
-    last_run = load_last_run(source)
-    subforums = {item["key"]: item for item in config.get("subforums", [])}
-    config.setdefault("tracker", {})
-    tracker_cfg = config["tracker"]
-    tracker_cfg.setdefault("state", "stopped")
-    tracker_cfg.setdefault("interval_minutes", 30)
-    tracker_cfg.setdefault("start_immediately", True)
-    tracker_cfg.setdefault("run_on_next", False)
-    tracker_cfg.setdefault("force_run", False)
-    tracker_cfg.setdefault("force_thread_ids", [])
-    tracker_cfg.setdefault("kill_switch", False)
-    tracker_state = tracker_cfg.get("state", "stopped")
-    kill_switch = bool(tracker_cfg.get("kill_switch"))
+    try:
+        config = load_config(source)
+        threads_payload = load_threads(source)
+        last_run = load_last_run(source)
+        subforums = {item["key"]: item for item in config.get("subforums", [])}
+        config.setdefault("tracker", {})
+        tracker_cfg = config["tracker"]
+        tracker_cfg.setdefault("state", "stopped")
+        tracker_cfg.setdefault("interval_minutes", 30)
+        tracker_cfg.setdefault("start_immediately", True)
+        tracker_cfg.setdefault("run_on_next", False)
+        tracker_cfg.setdefault("force_run", False)
+        tracker_cfg.setdefault("force_thread_ids", [])
+        tracker_cfg.setdefault("kill_switch", False)
+        tracker_state = tracker_cfg.get("state", "stopped")
+        kill_switch = bool(tracker_cfg.get("kill_switch"))
 
     st.sidebar.header("Controls")
     st.sidebar.caption(f"Tracker repo: {repo}")
-    tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Export"])
+    tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Export"])
 
     with tabs[0]:
         st.subheader("Tracker Status")
@@ -246,6 +279,25 @@ def main() -> None:
             st.success("Updated subforum limits")
 
     with tabs[3]:
+        st.subheader("Display Options")
+        chart_mode = st.selectbox(
+            "Chart style",
+            ["Lines", "Lines + markers", "Markers"],
+            index=0,
+        )
+        line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0)
+        y_scale = st.selectbox("Y-axis scale", ["linear", "log"], index=0)
+        auto_y = st.checkbox("Auto-scale Y axis", value=True)
+        if not auto_y:
+            y_min = st.number_input("Y min", value=0)
+            y_max = st.number_input("Y max", value=0)
+        else:
+            y_min = None
+            y_max = None
+        if y_scale == "log" and y_min is not None and y_min <= 0:
+            st.warning("Log scale requires Y min > 0.")
+
+    with tabs[4]:
         st.subheader("Export")
         export_payload = build_export(source, threads_payload.get("threads", []))
         st.download_button(
@@ -253,7 +305,7 @@ def main() -> None:
             data=json.dumps(export_payload, indent=2),
             file_name="bladeforums_views.json",
             mime="application/json",
-            key="download_json",
+            key=widget_key("download_json"),
         )
         csv_bytes = build_csv(export_payload)
         st.download_button(
@@ -261,7 +313,7 @@ def main() -> None:
             data=csv_bytes,
             file_name="bladeforums_views.csv",
             mime="text/csv",
-            key="download_csv",
+            key=widget_key("download_csv"),
         )
 
     st.header("Tracked Threads")
@@ -320,11 +372,30 @@ def main() -> None:
                 samples = load_samples(source, thread_id).get("samples", [])
                 if samples:
                     df = pd.DataFrame(samples)
-                    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-                    fig = px.line(df, x="ts", y="views", title="Views over time", height=220)
+                    df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+                    df["ts"] = df["ts"].dt.tz_convert("US/Eastern")
+                    if chart_mode == "Markers":
+                        fig = px.scatter(df, x="ts", y="views", title="Views over time", height=220)
+                    else:
+                        fig = px.line(
+                            df,
+                            x="ts",
+                            y="views",
+                            title="Views over time",
+                            height=220,
+                            markers=chart_mode == "Lines + markers",
+                            line_shape=line_shape,
+                        )
+                    fig.update_yaxes(type=y_scale)
+                    if y_min is not None or y_max is not None:
+                        fig.update_yaxes(range=[y_min, y_max])
+                    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No samples recorded yet.")
+            else:
+                st.info("No samples recorded yet.")
+    except Exception as exc:  # noqa: BLE001
+        handle_error(exc, github)
+        st.stop()
 
     st.header("Export")
     export_payload = build_export(source, threads)
