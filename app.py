@@ -52,6 +52,14 @@ def load_samples(source: DataSource, thread_id: str) -> dict[str, Any]:
     return fetch_json(source, f"data/samples/{thread_id}.json")
 
 
+@st.cache_data(ttl=60)
+def load_last_run(source: DataSource) -> dict[str, Any]:
+    try:
+        return fetch_json(source, "data/last_run.json")
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def refresh_cache() -> None:
     st.cache_data.clear()
 
@@ -63,66 +71,204 @@ def main() -> None:
 
     config = load_config(source)
     threads_payload = load_threads(source)
+    last_run = load_last_run(source)
     subforums = {item["key"]: item for item in config.get("subforums", [])}
+    config.setdefault("tracker", {})
+    tracker_cfg = config["tracker"]
+    tracker_cfg.setdefault("state", "stopped")
+    tracker_cfg.setdefault("interval_minutes", 30)
+    tracker_cfg.setdefault("start_immediately", True)
+    tracker_cfg.setdefault("run_on_next", False)
+    tracker_cfg.setdefault("force_run", False)
+    tracker_cfg.setdefault("force_thread_ids", [])
+    tracker_cfg.setdefault("kill_switch", False)
+    tracker_state = tracker_cfg.get("state", "stopped")
+    kill_switch = bool(tracker_cfg.get("kill_switch"))
 
-    st.sidebar.header("Settings")
+    st.sidebar.header("Controls")
     st.sidebar.caption(f"Tracker repo: {repo}")
-    max_rate = config.get("global", {}).get("max_requests_per_minute", 12)
-    new_rate = st.sidebar.number_input(
-        "Max requests per minute",
-        min_value=1,
-        max_value=19,
-        value=int(max_rate),
-        step=1,
-        disabled=read_only,
-    )
-    if not read_only and new_rate != max_rate:
-        if st.sidebar.button("Update rate limit", key="update_rate"):
-            config["global"]["max_requests_per_minute"] = int(new_rate)
-            update_json_file(github, "data/config.json", config, "Update rate limit")
-            refresh_cache()
-            st.sidebar.success("Updated rate limit")
+    tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Export"])
 
-    st.sidebar.subheader("Subforums")
-    for subforum in config.get("subforums", []):
-        label = f"{subforum['name']}"
-        max_pages = int(subforum.get("max_pages_per_update", 3))
-        new_pages = st.sidebar.number_input(
-            label,
+    with tabs[0]:
+        st.subheader("Tracker Status")
+        state_label = tracker_state.capitalize()
+        if kill_switch:
+            st.error("Kill switch is ON. Tracker will not run.")
+        elif tracker_state == "running":
+            st.success(f"Tracker: {state_label}")
+        elif tracker_state == "paused":
+            st.warning(f"Tracker: {state_label}")
+        else:
+            st.info(f"Tracker: {state_label}")
+
+        if tracker_cfg.get("force_run"):
+            st.warning("Ad hoc update queued.")
+        elif tracker_cfg.get("run_on_next"):
+            st.info("Tracker will run on the next workflow tick.")
+
+        next_run = last_run.get("next_run_at")
+        if next_run:
+            st.caption(f"Next scheduled run: {next_run}")
+        else:
+            st.caption("Next scheduled run: not scheduled")
+
+        st.write("Start/Stop/Pause")
+        start_immediately = st.checkbox(
+            "Run immediately on start",
+            value=bool(tracker_cfg.get("start_immediately", True)),
+            disabled=read_only,
+        )
+        if not read_only and start_immediately != tracker_cfg.get("start_immediately", True):
+            tracker_cfg["start_immediately"] = bool(start_immediately)
+            update_json_file(github, "data/config.json", config, "Update start preference")
+            refresh_cache()
+            st.success("Start preference updated")
+        cols = st.columns(3)
+        if cols[0].button("Start", disabled=read_only):
+            run_now = bool(tracker_cfg.get("start_immediately", True))
+            set_tracker_state(github, config, "running", run_on_next=run_now)
+            refresh_cache()
+            st.success("Tracker started")
+        if cols[1].button("Pause", disabled=read_only):
+            set_tracker_state(github, config, "paused")
+            refresh_cache()
+            st.warning("Tracker paused")
+        if cols[2].button("Stop", disabled=read_only):
+            set_tracker_state(github, config, "stopped")
+            refresh_cache()
+            st.info("Tracker stopped")
+
+        st.divider()
+        st.subheader("Intervals")
+        interval = int(tracker_cfg.get("interval_minutes", 30))
+        new_interval = st.number_input(
+            "Minutes between updates",
+            min_value=5,
+            max_value=240,
+            value=interval,
+            step=5,
+            disabled=read_only,
+        )
+        if not read_only and new_interval != interval:
+            if st.button("Update interval", key="update_interval"):
+                tracker_cfg["interval_minutes"] = int(new_interval)
+                update_json_file(github, "data/config.json", config, "Update interval")
+                refresh_cache()
+                st.success("Interval updated")
+
+        max_rate = config.get("global", {}).get("max_requests_per_minute", 12)
+        new_rate = st.number_input(
+            "Max requests per minute",
             min_value=1,
-            max_value=10,
-            value=max_pages,
+            max_value=19,
+            value=int(max_rate),
             step=1,
             disabled=read_only,
         )
-        if not read_only and new_pages != max_pages:
-            if st.sidebar.button(
-                f"Save pages for {subforum['key']}",
-                key=f"save_pages_{subforum['key']}",
-            ):
-                subforum["max_pages_per_update"] = int(new_pages)
-                update_json_file(github, "data/config.json", config, "Update subforum settings")
+        if not read_only and new_rate != max_rate:
+            if st.button("Update rate limit", key="update_rate"):
+                config["global"]["max_requests_per_minute"] = int(new_rate)
+                update_json_file(github, "data/config.json", config, "Update rate limit")
                 refresh_cache()
-                st.sidebar.success("Updated subforum settings")
+                st.success("Updated rate limit")
 
-    st.header("Add Thread")
-    with st.form("add_thread"):
-        title = st.text_input("Thread title (exact match)")
-        subforum_key = st.selectbox(
-            "Subforum",
-            options=[key for key in subforums.keys()],
-            format_func=lambda key: subforums[key]["name"],
+        st.divider()
+        st.subheader("Ad Hoc Update")
+        thread_options = {t["title"]: t for t in threads_payload.get("threads", [])}
+        selected_titles = st.multiselect(
+            "Threads to update now (empty = all)",
+            options=list(thread_options.keys()),
+            disabled=read_only,
         )
-        submitted = st.form_submit_button("Add thread", disabled=read_only)
-        if submitted:
-            if not title.strip():
-                st.error("Title is required")
-            else:
-                add_thread(github, title.strip(), subforum_key)
-                refresh_cache()
-                st.success("Thread added")
+        if st.button("Run update now", disabled=read_only):
+            force_ids = [thread_options[t]["id"] for t in selected_titles] if selected_titles else []
+            trigger_ad_hoc_update(github, config, force_ids)
+            refresh_cache()
+            st.success("Update triggered")
+
+        st.divider()
+        st.subheader("Kill Switch")
+        kill = st.checkbox("Enable kill switch", value=kill_switch, disabled=read_only)
+        if not read_only and kill != kill_switch:
+            tracker_cfg["kill_switch"] = bool(kill)
+            update_json_file(github, "data/config.json", config, "Update kill switch")
+            refresh_cache()
+            st.warning("Kill switch updated")
+
+        st.divider()
+        st.subheader("Reset Tracker (Destructive)")
+        confirm = st.text_input("Type RESET to enable", value="", disabled=read_only)
+        if st.button("Reset all samples", disabled=read_only or confirm != "RESET"):
+            reset_all_samples(github, threads_payload)
+            refresh_cache()
+            st.success("All samples reset")
+
+    with tabs[1]:
+        st.subheader("Add Thread")
+        with st.form("add_thread"):
+            title = st.text_input("Thread title (exact match)")
+            subforum_key = st.selectbox(
+                "Subforum",
+                options=[key for key in subforums.keys()],
+                format_func=lambda key: subforums[key]["name"],
+            )
+            submitted = st.form_submit_button("Add thread", disabled=read_only)
+            if submitted:
+                if not title.strip():
+                    st.error("Title is required")
+                else:
+                    add_thread(github, title.strip(), subforum_key)
+                    refresh_cache()
+                    st.success("Thread added")
+
+    with tabs[2]:
+        st.subheader("Subforum Page Limits")
+        data = [
+            {"Subforum": item["name"], "Max pages": int(item.get("max_pages_per_update", 3))}
+            for item in config.get("subforums", [])
+        ]
+        df = pd.DataFrame(data)
+        edited = st.data_editor(
+            df,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=read_only,
+            column_config={
+                "Subforum": st.column_config.TextColumn("Subforum", disabled=True),
+                "Max pages": st.column_config.NumberColumn("Max pages", min_value=1, max_value=10),
+            },
+        )
+        if st.button("Save subforum limits", disabled=read_only):
+            for idx, row in edited.iterrows():
+                config["subforums"][idx]["max_pages_per_update"] = int(row["Max pages"])
+            update_json_file(github, "data/config.json", config, "Update subforum settings")
+            refresh_cache()
+            st.success("Updated subforum limits")
+
+    with tabs[3]:
+        st.subheader("Export")
+        export_payload = build_export(source, threads_payload.get("threads", []))
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(export_payload, indent=2),
+            file_name="bladeforums_views.json",
+            mime="application/json",
+        )
+        csv_bytes = build_csv(export_payload)
+        st.download_button(
+            "Download CSV",
+            data=csv_bytes,
+            file_name="bladeforums_views.csv",
+            mime="text/csv",
+        )
 
     st.header("Tracked Threads")
+    if last_run:
+        note = last_run.get("note")
+        if note:
+            st.caption(f"Last run: {last_run.get('finished_at', 'unknown')} — {note}")
+        else:
+            st.caption(f"Last run: {last_run.get('finished_at', 'unknown')}")
     threads = threads_payload.get("threads", [])
     if not threads:
         st.info("No threads are being tracked yet.")
@@ -133,42 +279,50 @@ def main() -> None:
         status = thread.get("status", "active")
         last_view = thread.get("last_view_count")
         subforum_name = subforums.get(thread["subforum_key"], {}).get("name", thread["subforum_key"])
+        last_page = thread.get("last_found_page")
+        last_above = thread.get("last_found_above")
 
         with st.container(border=True):
-            st.subheader(thread["title"])
-            st.caption(f"{subforum_name} | Status: {status}")
-            st.write(f"Last view count: {last_view if last_view is not None else 'N/A'}")
+            cols = st.columns([2, 3])
+            with cols[0]:
+                st.subheader(thread["title"])
+                st.caption(f"{subforum_name} | Status: {status}")
+                st.write(f"Last view count: {last_view if last_view is not None else 'N/A'}")
+                if last_page is not None:
+                    st.write(
+                        f"Last found on page {last_page} with {last_above if last_above is not None else 'N/A'} threads above"
+                    )
+                controls = st.columns(3)
+                if status == "active":
+                    if controls[0].button("Pause", key=f"pause_{thread_id}", disabled=read_only):
+                        update_thread_status(github, thread_id, "paused")
+                        refresh_cache()
+                        st.success("Paused")
+                else:
+                    if controls[0].button("Resume", key=f"resume_{thread_id}", disabled=read_only):
+                        update_thread_status(github, thread_id, "active")
+                        refresh_cache()
+                        st.success("Resumed")
 
-            cols = st.columns(4)
-            if status == "active":
-                if cols[0].button("Pause", key=f"pause_{thread_id}", disabled=read_only):
-                    update_thread_status(github, thread_id, "paused")
+                if controls[1].button("Reset", key=f"reset_{thread_id}", disabled=read_only):
+                    reset_thread_samples(github, thread_id, thread["title"])
                     refresh_cache()
-                    st.success("Paused")
-            else:
-                if cols[0].button("Resume", key=f"resume_{thread_id}", disabled=read_only):
-                    update_thread_status(github, thread_id, "active")
+                    st.success("Reset samples")
+
+                if controls[2].button("Remove", key=f"remove_{thread_id}", disabled=read_only):
+                    remove_thread(github, thread_id)
                     refresh_cache()
-                    st.success("Resumed")
+                    st.success("Removed")
 
-            if cols[1].button("Reset", key=f"reset_{thread_id}", disabled=read_only):
-                reset_thread_samples(github, thread_id, thread["title"])
-                refresh_cache()
-                st.success("Reset samples")
-
-            if cols[2].button("Remove", key=f"remove_{thread_id}", disabled=read_only):
-                remove_thread(github, thread_id)
-                refresh_cache()
-                st.success("Removed")
-
-            samples = load_samples(source, thread_id).get("samples", [])
-            if samples:
-                df = pd.DataFrame(samples)
-                df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-                fig = px.line(df, x="ts", y="views", title="Views over time")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No samples recorded yet.")
+            with cols[1]:
+                samples = load_samples(source, thread_id).get("samples", [])
+                if samples:
+                    df = pd.DataFrame(samples)
+                    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+                    fig = px.line(df, x="ts", y="views", title="Views over time", height=220)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No samples recorded yet.")
 
     st.header("Export")
     export_payload = build_export(source, threads)
@@ -192,6 +346,41 @@ def update_json_file(github: GithubClient, path: str, payload: dict[str, Any], m
     if existing == payload:
         return
     github.put_file(path, payload, message, sha)
+
+
+def set_tracker_state(
+    github: GithubClient, config: dict[str, Any], state: str, run_on_next: bool = False
+) -> None:
+    config.setdefault("tracker", {})
+    config["tracker"]["state"] = state
+    config["tracker"]["run_on_next"] = bool(run_on_next)
+    update_json_file(github, "data/config.json", config, "Update tracker state")
+
+
+def trigger_ad_hoc_update(
+    github: GithubClient, config: dict[str, Any], force_thread_ids: list[str]
+) -> None:
+    config.setdefault("tracker", {})
+    config["tracker"]["force_run"] = True
+    config["tracker"]["force_thread_ids"] = force_thread_ids
+    update_json_file(github, "data/config.json", config, "Trigger ad hoc update")
+    github.dispatch_workflow("track.yml", "main")
+
+
+def reset_all_samples(github: GithubClient, threads_payload: dict[str, Any]) -> None:
+    for thread in threads_payload.get("threads", []):
+        thread_id = thread.get("id") or thread_id_for(thread["title"], thread["subforum_key"])
+        samples_payload = {"thread_id": thread_id, "title": thread["title"], "samples": []}
+        try:
+            _, sha = github.get_file(f"data/samples/{thread_id}.json")
+        except Exception:  # noqa: BLE001
+            sha = None
+        github.put_file(
+            f"data/samples/{thread_id}.json",
+            samples_payload,
+            "Reset all samples",
+            sha,
+        )
 
 
 def add_thread(github: GithubClient, title: str, subforum_key: str) -> None:

@@ -54,3 +54,11 @@ class GithubClient:
             payload["sha"] = sha
         resp = requests.put(url, headers=self._headers(), json=payload, timeout=20)
         resp.raise_for_status()
+
+    def dispatch_workflow(self, workflow_file: str, ref: str) -> None:
+        if not self.cfg.token:
+            raise RuntimeError("GITHUB_TOKEN not configured")
+        url = f"https://api.github.com/repos/{self.cfg.repo}/actions/workflows/{workflow_file}/dispatches"
+        payload = {"ref": ref}
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=20)
+        resp.raise_for_status()
