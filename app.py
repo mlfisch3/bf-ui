@@ -253,6 +253,7 @@ def main() -> None:
             data=json.dumps(export_payload, indent=2),
             file_name="bladeforums_views.json",
             mime="application/json",
+            key="download_json",
         )
         csv_bytes = build_csv(export_payload)
         st.download_button(
@@ -260,6 +261,7 @@ def main() -> None:
             data=csv_bytes,
             file_name="bladeforums_views.csv",
             mime="text/csv",
+            key="download_csv",
         )
 
     st.header("Tracked Threads")
