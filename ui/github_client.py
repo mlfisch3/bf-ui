@@ -61,4 +61,8 @@ class GithubClient:
         url = f"https://api.github.com/repos/{self.cfg.repo}/actions/workflows/{workflow_file}/dispatches"
         payload = {"ref": ref}
         resp = requests.post(url, headers=self._headers(), json=payload, timeout=20)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = resp.text
+            raise requests.HTTPError(f"{exc} :: {detail}") from exc

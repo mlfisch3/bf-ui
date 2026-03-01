@@ -437,7 +437,17 @@ def trigger_ad_hoc_update(
     config["tracker"]["force_run"] = True
     config["tracker"]["force_thread_ids"] = force_thread_ids
     update_json_file(github, "data/config.json", config, "Trigger ad hoc update")
-    github.dispatch_workflow("track.yml", "main")
+    try:
+        github.dispatch_workflow("track.yml", "main")
+    except Exception:  # noqa: BLE001
+        st.warning(
+            "Ad hoc dispatch failed. The tracker will run on the next scheduled tick instead."
+        )
+        st.info(
+            "If you want immediate runs, ensure your GitHub token has Actions: Read/Write "
+            "and the tracker repo allows workflow dispatch."
+        )
+        return
 
 
 def reset_all_samples(github: GithubClient, threads_payload: dict[str, Any]) -> None:
