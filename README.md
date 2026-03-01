@@ -11,6 +11,7 @@ Set these in Streamlit secrets or environment variables:
 - `GITHUB_TOKEN`: GitHub token with repo permissions (required for writes).
 
 The UI reads data from the tracker repo via GitHub raw URLs. If `GITHUB_TOKEN` is not set, the UI runs in read-only mode.
+For ad hoc updates, the token must include `Actions: Read and write` permission on the tracker repo.
 
 ## Run locally
 
