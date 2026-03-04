@@ -809,7 +809,21 @@ def main() -> None:
 
     with side_tabs[2]:
         st.subheader("Subforum retrieval limits")
+        st.caption("Increase max pages if a tracked thread has moved deeper in a subforum.")
+        apply_all_cols = st.columns([1.2, 1])
+        apply_all_value = apply_all_cols[0].number_input(
+            "Set max pages for all subforums",
+            min_value=1,
+            max_value=200,
+            value=3,
+            step=1,
+            disabled=read_only,
+            help="Higher values search deeper pages but increase request load and runtime.",
+        )
+        apply_all_clicked = apply_all_cols[1].button("Apply to all", disabled=read_only)
         rows = [{"Subforum": s["name"], "Max pages": int(s.get("max_pages_per_update", 3))} for s in config.get("subforums", [])]
+        if apply_all_clicked:
+            rows = [{"Subforum": r["Subforum"], "Max pages": int(apply_all_value)} for r in rows]
         edited = st.data_editor(
             pd.DataFrame(rows),
             hide_index=True,
@@ -817,7 +831,7 @@ def main() -> None:
             num_rows="fixed",
             column_config={
                 "Subforum": st.column_config.TextColumn("Subforum", disabled=True),
-                "Max pages": st.column_config.NumberColumn("Max pages", min_value=1, max_value=10),
+                "Max pages": st.column_config.NumberColumn("Max pages", min_value=1, max_value=200),
             },
         )
         if st.button("Save limits", disabled=read_only):
