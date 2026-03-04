@@ -20,3 +20,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Tests (local)
+
+Use the fallback test runner if `pytest` is not available in your runtime:
+
+```bash
+python3 tools/run_tests.py
+```
