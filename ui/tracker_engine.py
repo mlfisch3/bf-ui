@@ -199,27 +199,41 @@ def run_update(
     errors: list[dict[str, str]] = []
 
     global_cfg = config.get("global", {})
-    min_delay = float(global_cfg.get("min_delay_seconds", 3))
-    max_delay = float(global_cfg.get("max_delay_seconds", 9))
+    min_delay = float(global_cfg.get("min_delay_seconds", 0.2))
+    max_delay = float(global_cfg.get("max_delay_seconds", 1.0))
     max_retries = int(global_cfg.get("max_retries", 2))
     max_rpm = int(global_cfg.get("max_requests_per_minute", 12))
+    if max_delay < min_delay:
+        max_delay = min_delay
 
     grouped = _group_active_threads(threads_payload.get("threads", []), selected_thread_ids)
     subforums = {x["key"]: x for x in config.get("subforums", [])}
     samples_updates: dict[str, dict[str, Any]] = {}
 
     recent_calls: list[float] = []
+    last_call_at: float | None = None
+    target_interval = (60.0 / max_rpm) if max_rpm > 0 else 0.0
 
     def wait_budget() -> None:
-        nonlocal recent_calls
+        nonlocal recent_calls, last_call_at
         now = time.time()
         recent_calls = [t for t in recent_calls if now - t < 60]
         if max_rpm > 0 and len(recent_calls) >= max_rpm:
             wait = 60 - (now - recent_calls[0])
             if wait > 0:
                 time.sleep(wait)
-        time.sleep(random.uniform(min_delay, max_delay))
-        recent_calls.append(time.time())
+                now = time.time()
+                recent_calls = [t for t in recent_calls if now - t < 60]
+
+        jitter_wait = random.uniform(min_delay, max_delay) if max_delay > 0 else 0.0
+        cadence_wait = 0.0
+        if target_interval > 0 and last_call_at is not None:
+            cadence_wait = max(0.0, target_interval - (now - last_call_at))
+        wait_for = max(jitter_wait, cadence_wait)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        last_call_at = time.time()
+        recent_calls.append(last_call_at)
 
     session = requests.Session()
 

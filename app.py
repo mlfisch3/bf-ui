@@ -674,7 +674,7 @@ def main() -> None:
         max_rate_new = st.number_input(
             "Max requests per minute",
             min_value=1,
-            max_value=19,
+            max_value=120,
             value=max_rate,
             step=1,
             disabled=read_only,
@@ -682,6 +682,38 @@ def main() -> None:
         if not read_only and max_rate_new != max_rate:
             config.setdefault("global", {})["max_requests_per_minute"] = int(max_rate_new)
             put_json(github, "data/config.json", config, "Update rate limit")
+            st.rerun()
+
+        global_cfg = config.setdefault("global", {})
+        min_delay = float(global_cfg.get("min_delay_seconds", 0.2))
+        max_delay = float(global_cfg.get("max_delay_seconds", 1.0))
+        delay_cols = st.columns(2)
+        min_delay_new = float(
+            delay_cols[0].number_input(
+                "Min delay (s)",
+                min_value=0.0,
+                max_value=10.0,
+                value=min_delay,
+                step=0.1,
+                disabled=read_only,
+            )
+        )
+        max_delay_new = float(
+            delay_cols[1].number_input(
+                "Max delay (s)",
+                min_value=0.0,
+                max_value=15.0,
+                value=max_delay,
+                step=0.1,
+                disabled=read_only,
+            )
+        )
+        if max_delay_new < min_delay_new:
+            st.caption("Max delay is lower than min delay; it will be clamped to min delay.")
+        if not read_only and (min_delay_new != min_delay or max_delay_new != max_delay):
+            global_cfg["min_delay_seconds"] = float(min_delay_new)
+            global_cfg["max_delay_seconds"] = float(max(max_delay_new, min_delay_new))
+            put_json(github, "data/config.json", config, "Update request delay jitter")
             st.rerun()
 
         st.divider()
