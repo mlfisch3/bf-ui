@@ -531,6 +531,18 @@ def main() -> None:
         line_width = st.slider("Line width", min_value=1, max_value=6, value=2, key="disp_line_width")
         marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
         graph_only = st.toggle("Graph-only thread cards", value=False, key="disp_graph_only")
+        cards_per_row = 3
+        if graph_only:
+            cards_per_row = int(
+                st.number_input(
+                    "Graph-only cards per row",
+                    min_value=1,
+                    max_value=6,
+                    value=3,
+                    step=1,
+                    key="disp_cards_per_row",
+                )
+            )
         expanded_default = st.toggle("Expand thread cards by default", value=True, key="disp_expand_cards")
         auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
         y_min = y_max = None
@@ -547,6 +559,7 @@ def main() -> None:
             "y_min": y_min,
             "y_max": y_max,
             "graph_only": graph_only,
+            "cards_per_row": cards_per_row,
             "expanded_default": expanded_default,
         }
 
@@ -808,7 +821,8 @@ def main() -> None:
             st.info("No threads configured")
         else:
             subforum_name_map = {x["key"]: x["name"] for x in config.get("subforums", [])}
-            for idx, thread in enumerate(threads):
+
+            def render_thread(idx: int, thread: dict[str, Any]) -> None:
                 thread_id = thread["id"]
                 display_name = thread.get("display_name") or f"Thread {thread_id}"
                 current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
@@ -910,14 +924,14 @@ def main() -> None:
                     samples = payload.get("samples", [])
                     if not samples:
                         st.info("No samples recorded")
-                        continue
+                        return
 
                     df = pd.DataFrame(samples)
                     df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
                     df = df.dropna(subset=["ts", "views"]).copy()
                     if df.empty:
                         st.info("No valid samples")
-                        continue
+                        return
 
                     if "title_color" not in df.columns:
                         df["title_color"] = "#1f77b4"
@@ -953,6 +967,18 @@ def main() -> None:
                     if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
                         fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
                     st.plotly_chart(fig, use_container_width=True)
+
+            if chart_opts["graph_only"]:
+                per_row = max(1, int(chart_opts.get("cards_per_row", 3)))
+                for start in range(0, len(threads), per_row):
+                    row_items = threads[start : start + per_row]
+                    cols = st.columns(per_row)
+                    for offset, thread in enumerate(row_items):
+                        with cols[offset]:
+                            render_thread(start + offset, thread)
+            else:
+                for idx, thread in enumerate(threads):
+                    render_thread(idx, thread)
 
     with main_tabs[1]:
         history_df, color_lookup = build_history_table(source, sorted_threads(threads_payload))
