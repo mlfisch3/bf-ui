@@ -28,11 +28,26 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-.small-header {
-  font-size: 0.74rem;
-  line-height: 0.95rem;
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.history-table th, .history-table td {
+  border: 1px solid #d7d7d7;
+  padding: 4px;
+  text-align: right;
+  font-size: 0.72rem;
+}
+.history-table th {
   white-space: normal;
   word-break: break-word;
+  line-height: 0.88rem;
+  vertical-align: bottom;
+}
+.history-table td.ts-col {
+  text-align: left;
+  white-space: nowrap;
 }
 </style>
 """,
@@ -55,16 +70,23 @@ TITLE_COLORS = [
 ]
 
 
-def to_ny_24h(value: str | None) -> str:
+def to_ny_dt(value: str | None) -> datetime | None:
     if not value:
-        return "N/A"
+        return None
     try:
         dt = datetime.fromisoformat(value)
     except ValueError:
-        return str(value)
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.astimezone(NY_TZ)
+
+
+def to_ny_24h(value: str | None) -> str:
+    dt = to_ny_dt(value)
+    if not dt:
+        return "N/A" if value is None else str(value)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -99,28 +121,7 @@ def parse_thread_numeric_id(value: str) -> str | None:
     if text.isdigit():
         return text
     match = THREAD_ID_INPUT_RE.search(text)
-    if match:
-        return match.group(1)
-    return None
-
-
-def log_ui_error(github: GithubClient | None, exc: Exception) -> None:
-    st.error("Unexpected error")
-    st.exception(exc)
-    if not github:
-        return
-    try:
-        payload, sha = github.get_file("data/ui_errors.json")
-    except Exception:  # noqa: BLE001
-        payload, sha = {"errors": []}, None
-    payload.setdefault("errors", []).append(
-        {
-            "ts": utc_now(),
-            "error": str(exc),
-            "traceback": traceback.format_exc(),
-        }
-    )
-    github.put_file("data/ui_errors.json", payload, "Log UI error", sha)
+    return match.group(1) if match else None
 
 
 def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: str) -> None:
@@ -158,13 +159,7 @@ def load_runtime(source: DataSource) -> dict[str, Any]:
 
 
 def append_event(runtime: dict[str, Any], level: str, message: str) -> None:
-    runtime.setdefault("events", []).append(
-        {
-            "ts": utc_now(),
-            "level": level,
-            "message": message,
-        }
-    )
+    runtime.setdefault("events", []).append({"ts": utc_now(), "level": level, "message": message})
     runtime["events"] = runtime["events"][-200:]
 
 
@@ -172,21 +167,32 @@ def update_runtime_file(github: GithubClient, runtime: dict[str, Any], message: 
     put_json(github, "data/runtime.json", runtime, message)
 
 
-def set_tracker_state(
-    github: GithubClient,
-    config: dict[str, Any],
-    runtime: dict[str, Any],
-    new_state: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    tracker = config.setdefault("tracker", {})
-    tracker["state"] = new_state
-    if new_state != "running":
-        runtime["next_run_at"] = None
-        runtime["current_action"] = "idle"
-    append_event(runtime, "info", f"Tracker state changed to {new_state}")
-    put_json(github, "data/config.json", config, f"Set tracker state {new_state}")
-    update_runtime_file(github, runtime, f"Tracker {new_state}")
-    return config, runtime
+def normalize_threads_defaults(threads_payload: dict[str, Any]) -> bool:
+    changed = False
+    threads = threads_payload.get("threads", [])
+    for idx, thread in enumerate(sorted(threads, key=lambda x: x.get("order", 10_000))):
+        if "include_in_adhoc" not in thread:
+            thread["include_in_adhoc"] = True
+            changed = True
+        if "status" not in thread:
+            thread["status"] = "active"
+            changed = True
+        if "order" not in thread:
+            thread["order"] = idx
+            changed = True
+        if "title_history" not in thread:
+            thread["title_history"] = []
+            changed = True
+        if "title_color_map" not in thread:
+            thread["title_color_map"] = {}
+            changed = True
+    return changed
+
+
+def persist_threads_doc(github: GithubClient, threads_payload: dict[str, Any], message: str) -> None:
+    threads_doc, sha = github.get_file("data/threads.json")
+    threads_doc["threads"] = threads_payload.get("threads", [])
+    github.put_file("data/threads.json", threads_doc, message, sha)
 
 
 def load_sample_payload(github: GithubClient, thread: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -209,43 +215,36 @@ def load_sample_payload(github: GithubClient, thread: dict[str, Any]) -> tuple[d
 
 
 def ensure_title_color(thread: dict[str, Any], title: str) -> str:
-    title = title.strip() if title else "(Unknown Title)"
+    observed_title = title.strip() if title else "(Unknown Title)"
     color_map = thread.setdefault("title_color_map", {})
-    title_order = thread.setdefault("title_history", [])
-    if title not in color_map:
-        color_map[title] = TITLE_COLORS[len(title_order) % len(TITLE_COLORS)]
-        title_order.append(title)
-    return color_map[title]
+    title_history = thread.setdefault("title_history", [])
+    if observed_title not in color_map:
+        color_map[observed_title] = TITLE_COLORS[len(title_history) % len(TITLE_COLORS)]
+        title_history.append(observed_title)
+    return color_map[observed_title]
 
 
 def persist_update_results(
     github: GithubClient,
     threads_payload: dict[str, Any],
     sample_updates: dict[str, dict[str, Any]],
-    result_summary: dict[str, Any],
+    summary: dict[str, Any],
     runtime: dict[str, Any],
 ) -> None:
-    threads_current, threads_sha = github.get_file("data/threads.json")
-    threads_current["threads"] = threads_payload.get("threads", [])
-    github.put_file("data/threads.json", threads_current, "Update thread stats", threads_sha)
+    persist_threads_doc(github, threads_payload, "Update thread stats")
+    threads_by_id = {t["id"]: t for t in threads_payload.get("threads", [])}
 
-    by_thread = {t["id"]: t for t in threads_payload.get("threads", [])}
-    for thread_id, new_payload in sample_updates.items():
-        thread = by_thread.get(thread_id)
+    for thread_id, update_payload in sample_updates.items():
+        thread = threads_by_id.get(thread_id)
         if not thread:
             continue
         payload, sha = load_sample_payload(github, thread)
-        payload.setdefault("samples", []).extend(new_payload.get("samples", []))
+        payload.setdefault("samples", []).extend(update_payload.get("samples", []))
         payload["thread_numeric_id"] = thread.get("thread_numeric_id")
         payload["title"] = thread.get("current_title") or thread.get("display_name")
-        github.put_file(
-            f"data/samples/{thread_id}.json",
-            payload,
-            f"Append samples for {thread_id}",
-            sha,
-        )
+        github.put_file(f"data/samples/{thread_id}.json", payload, f"Append samples {thread_id}", sha)
 
-    runtime["last_run_summary"] = result_summary
+    runtime["last_run_summary"] = summary
     update_runtime_file(github, runtime, "Update runtime after tracker run")
 
 
@@ -257,14 +256,16 @@ def execute_update(
     selected_thread_ids: set[str] | None,
     reason: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    runtime["current_action"] = "updating"
+    tracker_state = config.get("tracker", {}).get("state", "stopped")
+    runtime["current_action"] = "updating" if tracker_state != "paused" else "updating (paused)"
     runtime["last_run_started_at"] = utc_now()
     runtime["last_run_result"] = "running"
     append_event(runtime, "info", f"Run started ({reason})")
     update_runtime_file(github, runtime, "Tracker run started")
 
     def set_action(text: str) -> None:
-        runtime["current_action"] = text
+        state = config.get("tracker", {}).get("state", "stopped")
+        runtime["current_action"] = text if state != "paused" else f"{text} (paused)"
         update_runtime_file(github, runtime, "Update runtime action")
 
     config, threads_payload, sample_updates, result = run_update(
@@ -275,7 +276,7 @@ def execute_update(
     )
 
     by_id = {t["id"]: t for t in threads_payload.get("threads", [])}
-    for thread_id, samples_payload in sample_updates.items():
+    for thread_id, update_payload in sample_updates.items():
         thread = by_id.get(thread_id)
         if not thread:
             continue
@@ -283,14 +284,16 @@ def execute_update(
         color = ensure_title_color(thread, observed_title)
         thread["current_title"] = observed_title
         thread["current_title_color"] = color
-        for sample in samples_payload.get("samples", []):
+        for sample in update_payload.get("samples", []):
             sample["observed_title"] = sample.get("observed_title") or observed_title
             sample["title_color"] = ensure_title_color(thread, sample["observed_title"])
 
-    runtime["current_action"] = "idle"
     runtime["last_run_finished_at"] = result.finished_at
     runtime["last_run_result"] = "ok" if not result.errors else "warning"
     runtime["next_run_at"] = next_run_timestamp(int(config.get("tracker", {}).get("interval_minutes", 30)))
+
+    state = config.get("tracker", {}).get("state", "stopped")
+    runtime["current_action"] = "paused" if state == "paused" else "idle"
 
     summary = {
         "started_at": result.started_at,
@@ -310,15 +313,14 @@ def execute_update(
     return config, threads_payload, runtime, summary
 
 
-def has_trackable_active_threads(threads_payload: dict[str, Any]) -> bool:
-    for thread in threads_payload.get("threads", []):
-        if thread.get("status", "active") == "active" and thread.get("thread_numeric_id"):
-            return True
-    return False
-
-
-def render_status(config: dict[str, Any], runtime: dict[str, Any], trackable: bool) -> None:
+def render_status(config: dict[str, Any], runtime: dict[str, Any]) -> None:
     state = config.get("tracker", {}).get("state", "stopped")
+    action = runtime.get("current_action", "idle")
+    if state == "paused" and action == "idle":
+        action = "paused"
+    elif state == "paused" and "(paused)" not in action:
+        action = f"{action} (paused)"
+
     cols = st.columns([1.2, 1, 1, 1])
     with cols[0]:
         if state == "running":
@@ -328,15 +330,12 @@ def render_status(config: dict[str, Any], runtime: dict[str, Any], trackable: bo
         else:
             st.info("State: Stopped")
     with cols[1]:
-        st.metric("Current action", runtime.get("current_action", "idle"))
+        st.metric("Current action", action)
     with cols[2]:
         st.metric("Last run", to_ny_24h(runtime.get("last_run_finished_at")))
     with cols[3]:
-        nxt = runtime.get("next_run_at") if state == "running" else None
-        st.metric("Next run", to_ny_24h(nxt))
-
-    if state == "running" and not trackable:
-        st.warning("Tracker is running, but no active threads have a thread numeric ID.")
+        next_run = runtime.get("next_run_at") if state == "running" else None
+        st.metric("Next run", to_ny_24h(next_run))
 
 
 def load_samples(source: DataSource, thread_id: str) -> dict[str, Any]:
@@ -350,168 +349,137 @@ def abbreviate_label(label: str, width: int = 12) -> str:
     return text[: width - 1] + "…"
 
 
-def build_history_table(
-    source: DataSource,
-    threads: list[dict[str, Any]],
-) -> tuple[pd.DataFrame, dict[tuple[str, str], str]]:
-    data_rows: list[dict[str, Any]] = []
+def build_history_table(source: DataSource, threads: list[dict[str, Any]]) -> tuple[pd.DataFrame, dict[tuple[str, str], str]]:
+    rows: list[dict[str, Any]] = []
     color_lookup: dict[tuple[str, str], str] = {}
-    for thread in threads:
-        if not thread.get("id"):
-            continue
-        col = abbreviate_label(thread.get("display_name") or thread.get("current_title") or thread["id"])
-        payload = load_samples(source, thread["id"])
-        for sample in payload.get("samples", []):
-            ts_label = to_ny_24h(sample.get("ts"))
-            value = sample.get("views")
-            if value is None:
-                continue
-            data_rows.append({"ts": ts_label, "thread_col": col, "value": int(value)})
-            if sample.get("title_color"):
-                color_lookup[(ts_label, col)] = str(sample["title_color"])
 
-    if not data_rows:
+    for thread in threads:
+        thread_id = thread.get("id")
+        if not thread_id:
+            continue
+        col_name = abbreviate_label(thread.get("display_name") or thread.get("current_title") or thread_id)
+        samples_payload = load_samples(source, thread_id)
+        for sample in samples_payload.get("samples", []):
+            ts = to_ny_24h(sample.get("ts"))
+            views = sample.get("views")
+            if views is None:
+                continue
+            rows.append({"ts": ts, "thread": col_name, "value": int(views)})
+            if sample.get("title_color"):
+                color_lookup[(ts, col_name)] = str(sample["title_color"])
+
+    if not rows:
         return pd.DataFrame(), color_lookup
 
-    df_long = pd.DataFrame(data_rows)
-    pivot = df_long.pivot_table(index="ts", columns="thread_col", values="value", aggfunc="last")
+    df = pd.DataFrame(rows)
+    pivot = df.pivot_table(index="ts", columns="thread", values="value", aggfunc="last")
     pivot = pivot.sort_index(ascending=False)
     return pivot, color_lookup
 
 
-def style_history(df: pd.DataFrame, color_lookup: dict[tuple[str, str], str]) -> Any:
-    def style_cell(v: Any, ts: str, col: str) -> str:
-        if pd.isna(v):
-            return ""
-        color = color_lookup.get((ts, col), "#111111")
-        return f"color: {color}; font-weight: 600;"
+def render_history_html(df: pd.DataFrame, color_lookup: dict[tuple[str, str], str]) -> None:
+    if df.empty:
+        st.info("No samples available")
+        return
 
-    styles = pd.DataFrame("", index=df.index, columns=df.columns)
-    for ts in df.index:
+    headers = ["Timestamp"] + list(df.columns)
+    html = ["<table class='history-table'><thead><tr>"]
+    for header in headers:
+        html.append(f"<th>{header}</th>")
+    html.append("</tr></thead><tbody>")
+
+    for ts, row in df.iterrows():
+        html.append("<tr>")
+        html.append(f"<td class='ts-col'>{ts}</td>")
         for col in df.columns:
-            styles.loc[ts, col] = style_cell(df.loc[ts, col], ts, col)
-    return df.style.apply(lambda _: styles, axis=None)
+            value = row[col]
+            if pd.isna(value):
+                html.append("<td></td>")
+            else:
+                color = color_lookup.get((ts, col), "#111111")
+                html.append(f"<td style='color:{color};font-weight:600'>{int(value)}</td>")
+        html.append("</tr>")
+
+    html.append("</tbody></table>")
+    st.markdown("".join(html), unsafe_allow_html=True)
 
 
 def render_title_legend(thread: dict[str, Any]) -> None:
-    titles = thread.get("title_history", [])
-    colors = thread.get("title_color_map", {})
-    if not titles:
+    title_history = thread.get("title_history", [])
+    color_map = thread.get("title_color_map", {})
+    if not title_history:
         return
-    st.markdown("**Observed titles (in order):**")
-    for idx, t in enumerate(titles, start=1):
-        color = colors.get(t, "#111111")
-        st.markdown(f"<span style='color:{color};'>{idx}. {t}</span>", unsafe_allow_html=True)
+    st.markdown("**Observed titles (in order)**")
+    for idx, title in enumerate(title_history, start=1):
+        color = color_map.get(title, "#111111")
+        st.markdown(f"<span style='color:{color};'>{idx}. {title}</span>", unsafe_allow_html=True)
 
 
-def render_thread_card(
-    source: DataSource,
-    thread: dict[str, Any],
-    subforum_name: str,
-    read_only: bool,
-    chart_opts: dict[str, Any],
-    on_pause_resume: callable,
-    on_reset: callable,
-    on_remove: callable,
-    on_set_numeric_id: callable,
-    on_toggle_adhoc: callable,
-    on_refresh_one: callable,
-) -> None:
-    tid = thread["id"]
-    status = thread.get("status", "active")
-    display_name = thread.get("display_name") or f"Thread {tid}"
-    current_title = thread.get("current_title") or thread.get("last_seen_title") or thread.get("display_name") or "N/A"
-    current_title_color = thread.get("current_title_color", "#111111")
+def choose_dtick_ms(ts_values: pd.Series) -> int | None:
+    if ts_values.empty:
+        return None
+    span = ts_values.max() - ts_values.min()
+    hours = span.total_seconds() / 3600 if span is not pd.NaT else 0
+    if hours <= 24:
+        return 60 * 60 * 1000
+    if hours <= 72:
+        return 2 * 60 * 60 * 1000
+    if hours <= 7 * 24:
+        return 6 * 60 * 60 * 1000
+    return None
 
-    with st.expander(f"{display_name} ({status})", expanded=False):
-        left, right = st.columns([2, 3])
-        with left:
-            st.write(f"**Current title:** <span style='color:{current_title_color};'>{current_title}</span>", unsafe_allow_html=True)
-            st.caption(subforum_name)
-            st.write(f"Thread numeric ID: `{thread.get('thread_numeric_id') or 'MISSING'}`")
-            st.write(f"Last views: `{thread.get('last_view_count', 'N/A')}`")
-            if thread.get("last_found_page") is not None:
-                st.write(
-                    f"Last location: page {thread.get('last_found_page')} | threads above: {thread.get('last_found_above', 'N/A')}"
-                )
-            st.write(f"Last seen: {to_ny_24h(thread.get('last_seen_at'))}")
 
-            include_adhoc = bool(thread.get("include_in_adhoc", True))
-            include_adhoc_new = st.toggle(
-                "Include in selected ad hoc refresh",
-                value=include_adhoc,
-                key=f"adhoc_{tid}",
-                disabled=read_only,
-            )
-            if include_adhoc_new != include_adhoc and not read_only:
-                on_toggle_adhoc(tid, include_adhoc_new)
+def sorted_threads(threads_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    threads = threads_payload.get("threads", [])
+    return sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
 
-            c1, c2, c3, c4 = st.columns(4)
-            if status == "active":
-                if c1.button("Pause", key=f"pause_{tid}", disabled=read_only):
-                    on_pause_resume(tid, "paused")
-            else:
-                if c1.button("Resume", key=f"resume_{tid}", disabled=read_only):
-                    on_pause_resume(tid, "active")
-            if c2.button("Refresh", key=f"refresh_{tid}", disabled=read_only or not thread.get("thread_numeric_id")):
-                on_refresh_one(tid)
-            if c3.button("Reset", key=f"reset_{tid}", disabled=read_only):
-                on_reset(thread)
-            if c4.button("Remove", key=f"remove_{tid}", disabled=read_only):
-                on_remove(tid)
 
-            current_id = str(thread.get("thread_numeric_id") or "")
-            new_id = st.text_input("Edit thread URL or numeric ID", value=current_id, key=f"set_id_{tid}")
-            if st.button("Save thread ID", key=f"save_id_{tid}", disabled=read_only):
-                numeric = parse_thread_numeric_id(new_id)
-                if not numeric:
-                    st.error("Invalid URL/ID")
-                else:
-                    on_set_numeric_id(tid, numeric)
+def move_thread_order(threads: list[dict[str, Any]], thread_id: str, delta: int) -> list[dict[str, Any]]:
+    ordered = sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
+    idx = next((i for i, t in enumerate(ordered) if t.get("id") == thread_id), None)
+    if idx is None:
+        return ordered
+    new_idx = idx + delta
+    if new_idx < 0 or new_idx >= len(ordered):
+        return ordered
+    ordered[idx], ordered[new_idx] = ordered[new_idx], ordered[idx]
+    for i, thread in enumerate(ordered):
+        thread["order"] = i
+    return ordered
 
-            render_title_legend(thread)
 
-        with right:
-            payload = load_samples(source, tid)
-            samples = payload.get("samples", [])
-            if not samples:
-                st.info("No samples recorded")
-                return
+def run_local_update_if_due(
+    github: GithubClient | None,
+    config: dict[str, Any],
+    threads_payload: dict[str, Any],
+    runtime: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+    if not github:
+        return config, threads_payload, runtime, False
+    state = config.get("tracker", {}).get("state", "stopped")
+    if state != "running":
+        return config, threads_payload, runtime, False
 
-            df = pd.DataFrame(samples)
-            df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
-            df = df.dropna(subset=["ts", "views"]).copy()
-            if df.empty:
-                st.info("No valid samples")
-                return
+    has_trackable = any(
+        t.get("status", "active") == "active" and t.get("thread_numeric_id")
+        for t in threads_payload.get("threads", [])
+    )
+    if not has_trackable:
+        return config, threads_payload, runtime, False
+    if runtime.get("current_action", "idle").startswith("updating"):
+        return config, threads_payload, runtime, False
+    if not due_for_run(runtime.get("next_run_at")):
+        return config, threads_payload, runtime, False
 
-            if "title_color" not in df.columns:
-                df["title_color"] = "#1f77b4"
-            df["title_color"] = df["title_color"].fillna("#1f77b4")
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=df["ts"],
-                    y=df["views"],
-                    mode=chart_opts["mode"],
-                    line={"shape": chart_opts["line_shape"], "width": chart_opts["line_width"], "color": "#444444"},
-                    marker={"size": chart_opts["marker_size"], "color": df["title_color"]},
-                    name="Views",
-                    customdata=df[["title_color"]],
-                )
-            )
-            fig.update_layout(
-                height=520,
-                margin={"l": 10, "r": 10, "t": 35, "b": 10},
-                xaxis_title="Timestamp (America/New_York)",
-                yaxis_title="Views",
-            )
-            fig.update_xaxes(tickformat="%Y-%m-%d %H:%M", hoverformat="%Y-%m-%d %H:%M:%S")
-            fig.update_yaxes(type=chart_opts["y_scale"])
-            if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
-                fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
-            st.plotly_chart(fig, use_container_width=True)
+    config, threads_payload, runtime, _ = execute_update(
+        github,
+        config,
+        threads_payload,
+        runtime,
+        selected_thread_ids=None,
+        reason="interval",
+    )
+    return config, threads_payload, runtime, True
 
 
 def main() -> None:
@@ -526,7 +494,15 @@ def main() -> None:
         threads_payload = fetch_or_default(source, "data/threads.json", {"schema_version": 1, "threads": []})
         runtime = load_runtime(source)
     except Exception as exc:  # noqa: BLE001
-        log_ui_error(github, exc)
+        if github:
+            try:
+                payload, sha = github.get_file("data/ui_errors.json")
+            except Exception:  # noqa: BLE001
+                payload, sha = {"errors": []}, None
+            payload.setdefault("errors", []).append({"ts": utc_now(), "error": str(exc), "traceback": traceback.format_exc()})
+            github.put_file("data/ui_errors.json", payload, "Log UI error", sha)
+        st.error("Unexpected error")
+        st.exception(exc)
         st.stop()
 
     tracker_cfg = config.setdefault("tracker", {})
@@ -534,38 +510,61 @@ def main() -> None:
     tracker_cfg.setdefault("interval_minutes", 30)
     tracker_cfg.setdefault("start_immediately", True)
 
-    for thread in threads_payload.get("threads", []):
-        thread.setdefault("include_in_adhoc", True)
+    defaults_changed = normalize_threads_defaults(threads_payload)
+    if defaults_changed and github and not read_only:
+        persist_threads_doc(github, threads_payload, "Normalize thread defaults")
 
     state = tracker_cfg.get("state", "stopped")
     if state == "running":
         st_autorefresh(interval=15000, key="tracker_refresh")
 
-    trackable = has_trackable_active_threads(threads_payload)
-    render_status(config, runtime, trackable)
+    render_status(config, runtime)
 
     st.sidebar.header("Controls")
-    tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Export"])
+    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Export"])
 
-    with tabs[0]:
+    with side_tabs[3]:
+        st.subheader("Display options")
+        style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
+        line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0, key="disp_line_shape")
+        y_scale = st.selectbox("Y scale", ["linear", "log"], index=0, key="disp_y_scale")
+        line_width = st.slider("Line width", min_value=1, max_value=6, value=2, key="disp_line_width")
+        marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
+        graph_only = st.toggle("Graph-only thread cards", value=False, key="disp_graph_only")
+        expanded_default = st.toggle("Expand thread cards by default", value=True, key="disp_expand_cards")
+        auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
+        y_min = y_max = None
+        if not auto_y:
+            y_min = st.number_input("Y min", value=0.0, key="disp_y_min")
+            y_max = st.number_input("Y max", value=1000.0, key="disp_y_max")
+
+        chart_opts = {
+            "mode": style,
+            "line_shape": line_shape,
+            "y_scale": y_scale,
+            "line_width": line_width,
+            "marker_size": marker_size,
+            "y_min": y_min,
+            "y_max": y_max,
+            "graph_only": graph_only,
+            "expanded_default": expanded_default,
+        }
+
+    with side_tabs[0]:
         interval = int(tracker_cfg.get("interval_minutes", 30))
         run_immediately = bool(tracker_cfg.get("start_immediately", True))
 
-        st.subheader("Run Controls")
-        run_immediately_new = st.checkbox(
-            "Run immediately on start",
-            value=run_immediately,
-            disabled=read_only,
-            key="run_immediately",
-        )
+        st.subheader("Run controls")
+        run_immediately_new = st.checkbox("Run immediately on start", value=run_immediately, disabled=read_only)
         if not read_only and run_immediately_new != run_immediately:
             tracker_cfg["start_immediately"] = run_immediately_new
             put_json(github, "data/config.json", config, "Update start behavior")
             st.rerun()
 
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("Start", disabled=read_only or state == "running", key="btn_start"):
-            config, runtime = set_tracker_state(github, config, runtime, "running")
+        if c1.button("Start", disabled=read_only or state == "running"):
+            tracker_cfg["state"] = "running"
+            append_event(runtime, "info", "Tracker state changed to running")
             if tracker_cfg.get("start_immediately", True):
                 config, threads_payload, runtime, _ = execute_update(
                     github,
@@ -576,22 +575,36 @@ def main() -> None:
                     reason="start_immediate",
                 )
             else:
+                runtime["current_action"] = "idle"
                 runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_minutes", 30)))
-                update_runtime_file(github, runtime, "Schedule next run")
+            put_json(github, "data/config.json", config, "Set tracker state running")
+            update_runtime_file(github, runtime, "Tracker running")
             st.rerun()
 
-        if c2.button("Pause", disabled=read_only or state != "running", key="btn_pause"):
-            config, runtime = set_tracker_state(github, config, runtime, "paused")
+        if c2.button("Pause", disabled=read_only or state != "running"):
+            tracker_cfg["state"] = "paused"
+            runtime["current_action"] = "paused"
+            append_event(runtime, "info", "Tracker state changed to paused")
+            put_json(github, "data/config.json", config, "Set tracker state paused")
+            update_runtime_file(github, runtime, "Tracker paused")
             st.rerun()
 
-        if c3.button("Resume", disabled=read_only or state != "paused", key="btn_resume"):
-            config, runtime = set_tracker_state(github, config, runtime, "running")
+        if c3.button("Resume", disabled=read_only or state != "paused"):
+            tracker_cfg["state"] = "running"
+            runtime["current_action"] = "idle"
             runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_minutes", 30)))
-            update_runtime_file(github, runtime, "Resume tracker")
+            append_event(runtime, "info", "Tracker state changed to running")
+            put_json(github, "data/config.json", config, "Set tracker state running")
+            update_runtime_file(github, runtime, "Tracker resumed")
             st.rerun()
 
-        if c4.button("Stop", disabled=read_only or state == "stopped", key="btn_stop"):
-            config, runtime = set_tracker_state(github, config, runtime, "stopped")
+        if c4.button("Stop", disabled=read_only or state == "stopped"):
+            tracker_cfg["state"] = "stopped"
+            runtime["current_action"] = "idle"
+            runtime["next_run_at"] = None
+            append_event(runtime, "info", "Tracker state changed to stopped")
+            put_json(github, "data/config.json", config, "Set tracker state stopped")
+            update_runtime_file(github, runtime, "Tracker stopped")
             st.rerun()
 
         st.divider()
@@ -602,7 +615,6 @@ def main() -> None:
             value=interval,
             step=5,
             disabled=read_only,
-            key="interval_minutes",
         )
         if not read_only and interval_new != interval:
             tracker_cfg["interval_minutes"] = int(interval_new)
@@ -620,7 +632,6 @@ def main() -> None:
             value=max_rate,
             step=1,
             disabled=read_only,
-            key="max_rpm",
         )
         if not read_only and max_rate_new != max_rate:
             config.setdefault("global", {})["max_requests_per_minute"] = int(max_rate_new)
@@ -630,12 +641,12 @@ def main() -> None:
         st.divider()
         st.subheader("Ad hoc update")
         selected_threads = [
-            t for t in threads_payload.get("threads", [])
+            t
+            for t in sorted_threads(threads_payload)
             if t.get("status", "active") == "active"
             and t.get("thread_numeric_id")
             and bool(t.get("include_in_adhoc", True))
         ]
-        st.write("Selected threads:")
         if selected_threads:
             for t in selected_threads:
                 st.write(f"- {t.get('display_name') or t.get('current_title') or t['id']}")
@@ -644,11 +655,10 @@ def main() -> None:
 
         if st.button(
             "Refresh selected threads",
-            disabled=read_only or runtime.get("current_action") == "updating" or not selected_threads,
-            key="refresh_selected_threads",
+            disabled=read_only or runtime.get("current_action", "idle").startswith("updating") or not selected_threads,
         ):
             selected_ids = {t["id"] for t in selected_threads}
-            config, threads_payload, runtime, summary = execute_update(
+            config, threads_payload, runtime, _ = execute_update(
                 github,
                 config,
                 threads_payload,
@@ -656,22 +666,18 @@ def main() -> None:
                 selected_thread_ids=selected_ids,
                 reason="adhoc_selected",
             )
-            if summary.get("errors"):
-                st.warning(f"Update finished with {len(summary['errors'])} errors")
-            else:
-                st.success("Update finished")
             st.rerun()
 
-        all_active_trackable = [
-            t for t in threads_payload.get("threads", [])
+        all_active = [
+            t
+            for t in threads_payload.get("threads", [])
             if t.get("status", "active") == "active" and t.get("thread_numeric_id")
         ]
         if st.button(
             "Refresh all active threads",
-            disabled=read_only or runtime.get("current_action") == "updating" or not all_active_trackable,
-            key="refresh_all_active",
+            disabled=read_only or runtime.get("current_action", "idle").startswith("updating") or not all_active,
         ):
-            config, threads_payload, runtime, summary = execute_update(
+            config, threads_payload, runtime, _ = execute_update(
                 github,
                 config,
                 threads_payload,
@@ -679,24 +685,16 @@ def main() -> None:
                 selected_thread_ids=None,
                 reason="adhoc_all_active",
             )
-            if summary.get("errors"):
-                st.warning(f"Update finished with {len(summary['errors'])} errors")
-            else:
-                st.success("Update finished")
             st.rerun()
 
-    with tabs[1]:
-        st.subheader("Add Thread")
+    with side_tabs[1]:
+        st.subheader("Add thread")
         with st.form("add_thread_form"):
             id_or_url = st.text_input("Thread URL or numeric ID")
             display_name = st.text_input("Display name (optional)")
             subforums = config.get("subforums", [])
             subforum_map = {x["key"]: x["name"] for x in subforums}
-            subforum_key = st.selectbox(
-                "Subforum",
-                options=list(subforum_map.keys()),
-                format_func=lambda x: subforum_map[x],
-            )
+            subforum_key = st.selectbox("Subforum", options=list(subforum_map.keys()), format_func=lambda x: subforum_map[x])
             submitted = st.form_submit_button("Add", disabled=read_only)
             if submitted:
                 numeric = parse_thread_numeric_id(id_or_url)
@@ -713,32 +711,31 @@ def main() -> None:
                         st.warning("Thread already exists")
                     else:
                         label = display_name.strip() if display_name.strip() else f"Thread {numeric}"
-                        tid = thread_id_for(f"{numeric}-{subforum_key}", subforum_key)
+                        new_id = thread_id_for(f"{numeric}-{subforum_key}", subforum_key)
+                        order_val = max([x.get("order", -1) for x in threads] + [-1]) + 1
                         threads.append(
                             {
-                                "id": tid,
+                                "id": new_id,
                                 "display_name": label,
                                 "thread_numeric_id": str(numeric),
                                 "subforum_key": subforum_key,
                                 "status": "active",
                                 "include_in_adhoc": True,
+                                "order": order_val,
                                 "created_at": utc_now(),
+                                "title_history": [],
+                                "title_color_map": {},
                             }
                         )
                         threads_doc["threads"] = threads
                         github.put_file("data/threads.json", threads_doc, "Add tracked thread", sha)
-                        st.success("Thread added")
                         st.rerun()
 
-    with tabs[2]:
+    with side_tabs[2]:
         st.subheader("Subforum retrieval limits")
-        subforum_rows = [
-            {"Subforum": s["name"], "Max pages": int(s.get("max_pages_per_update", 3))}
-            for s in config.get("subforums", [])
-        ]
-        table = pd.DataFrame(subforum_rows)
+        rows = [{"Subforum": s["name"], "Max pages": int(s.get("max_pages_per_update", 3))} for s in config.get("subforums", [])]
         edited = st.data_editor(
-            table,
+            pd.DataFrame(rows),
             hide_index=True,
             disabled=read_only,
             num_rows="fixed",
@@ -747,60 +744,31 @@ def main() -> None:
                 "Max pages": st.column_config.NumberColumn("Max pages", min_value=1, max_value=10),
             },
         )
-        if st.button("Save limits", disabled=read_only, key="save_limits"):
+        if st.button("Save limits", disabled=read_only):
             for idx, row in edited.iterrows():
                 config["subforums"][idx]["max_pages_per_update"] = int(row["Max pages"])
             put_json(github, "data/config.json", config, "Update subforum limits")
-            st.success("Saved")
             st.rerun()
 
-    with tabs[3]:
-        st.subheader("Display options")
-        style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
-        line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0, key="disp_line_shape")
-        y_scale = st.selectbox("Y scale", ["linear", "log"], index=0, key="disp_y_scale")
-        line_width = st.slider("Line width", min_value=1, max_value=6, value=2, key="disp_line_width")
-        marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
-        auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
-        y_min = y_max = None
-        if not auto_y:
-            y_min = st.number_input("Y min", value=0.0, key="disp_y_min")
-            y_max = st.number_input("Y max", value=1000.0, key="disp_y_max")
-
-        chart_opts = {
-            "mode": style,
-            "line_shape": line_shape,
-            "y_scale": y_scale,
-            "line_width": line_width,
-            "marker_size": marker_size,
-            "y_min": y_min,
-            "y_max": y_max,
-        }
-
-    with tabs[4]:
+    with side_tabs[4]:
         st.subheader("Export")
         export_threads = []
-        for thread in threads_payload.get("threads", []):
-            export_threads.append(
-                {
-                    "thread": thread,
-                    "samples": load_samples(source, thread["id"]).get("samples", []),
-                }
-            )
-        export_payload = {"generated_at": utc_now(), "threads": export_threads}
+        for thread in sorted_threads(threads_payload):
+            export_threads.append({"thread": thread, "samples": load_samples(source, thread["id"]).get("samples", [])})
+
+        payload = {"generated_at": utc_now(), "threads": export_threads}
         st.download_button(
             "Download JSON",
-            data=json.dumps(export_payload, indent=2),
+            data=json.dumps(payload, indent=2),
             file_name="bladeforums_views.json",
             mime="application/json",
-            key="download_json",
         )
 
-        rows = []
+        csv_rows = []
         for item in export_threads:
             thread = item["thread"]
             for sample in item["samples"]:
-                rows.append(
+                csv_rows.append(
                     {
                         "thread_id": thread.get("id"),
                         "thread_numeric_id": thread.get("thread_numeric_id"),
@@ -815,118 +783,191 @@ def main() -> None:
                         "title_color": sample.get("title_color"),
                     }
                 )
-        csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8") if rows else b""
-        st.download_button(
-            "Download CSV",
-            data=csv_bytes,
-            file_name="bladeforums_views.csv",
-            mime="text/csv",
-            key="download_csv",
-        )
+        csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8") if csv_rows else b""
+        st.download_button("Download CSV", data=csv_bytes, file_name="bladeforums_views.csv", mime="text/csv")
 
-    # Apply interval run only after controls are handled so Pause acts immediately.
-    if (
-        github
-        and tracker_cfg.get("state") == "running"
-        and trackable
-        and runtime.get("current_action") != "updating"
-        and due_for_run(runtime.get("next_run_at"))
-    ):
-        config, threads_payload, runtime, _ = execute_update(
-            github,
-            config,
-            threads_payload,
-            runtime,
-            selected_thread_ids=None,
-            reason="interval",
-        )
+    config, threads_payload, runtime, did_run = run_local_update_if_due(github, config, threads_payload, runtime)
+    if did_run:
         st.rerun()
 
-    with st.expander("Runtime Events", expanded=False):
-        events = runtime.get("events", [])
-        if events:
-            df = pd.DataFrame(events[-50:])
-            df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
-            df["ts"] = df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            st.dataframe(df[["ts", "level", "message"]], use_container_width=True, hide_index=True)
-        else:
-            st.caption("No runtime events yet")
+    main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events"])
 
-    main_tabs = st.tabs(["Thread Cards", "History Table"])
-
-    def update_threads_doc(mutator: callable, commit_message: str) -> None:
+    def mutate_threads(mutator: callable, message: str) -> None:
         threads_doc, sha = github.get_file("data/threads.json")
         mutator(threads_doc)
-        github.put_file("data/threads.json", threads_doc, commit_message, sha)
+        threads_list = sorted(threads_doc.get("threads", []), key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
+        for i, thread in enumerate(threads_list):
+            thread["order"] = i
+        threads_doc["threads"] = threads_list
+        github.put_file("data/threads.json", threads_doc, message, sha)
         st.rerun()
 
     with main_tabs[0]:
-        st.subheader("Tracked Threads")
-        subforum_name_map = {x["key"]: x["name"] for x in config.get("subforums", [])}
-
-        threads = threads_payload.get("threads", [])
+        threads = sorted_threads(threads_payload)
         if not threads:
             st.info("No threads configured")
         else:
-            for thread in threads:
-                render_thread_card(
-                    source=source,
-                    thread=thread,
-                    subforum_name=subforum_name_map.get(thread.get("subforum_key"), thread.get("subforum_key", "Unknown")),
-                    read_only=read_only,
-                    chart_opts=chart_opts,
-                    on_pause_resume=lambda tid, status: update_threads_doc(
-                        lambda doc: [t.update({"status": status}) for t in doc.get("threads", []) if t.get("id") == tid],
-                        "Update thread status",
-                    ),
-                    on_reset=lambda t: (
-                        github.put_file(
-                            f"data/samples/{t['id']}.json",
-                            {
-                                "thread_id": t["id"],
-                                "thread_numeric_id": t.get("thread_numeric_id"),
-                                "title": t.get("display_name"),
-                                "samples": [],
-                            },
-                            "Reset thread samples",
-                            load_sample_payload(github, t)[1],
-                        ),
-                        st.rerun(),
-                    ),
-                    on_remove=lambda tid: update_threads_doc(
-                        lambda doc: doc.update({"threads": [x for x in doc.get("threads", []) if x.get("id") != tid]}),
-                        "Remove thread",
-                    ),
-                    on_set_numeric_id=lambda tid, nid: update_threads_doc(
-                        lambda doc: [x.update({"thread_numeric_id": str(nid)}) for x in doc.get("threads", []) if x.get("id") == tid],
-                        "Set thread numeric id",
-                    ),
-                    on_toggle_adhoc=lambda tid, val: update_threads_doc(
-                        lambda doc: [x.update({"include_in_adhoc": bool(val)}) for x in doc.get("threads", []) if x.get("id") == tid],
-                        "Toggle ad hoc inclusion",
-                    ),
-                    on_refresh_one=lambda tid: (
+            subforum_name_map = {x["key"]: x["name"] for x in config.get("subforums", [])}
+            for idx, thread in enumerate(threads):
+                thread_id = thread["id"]
+                display_name = thread.get("display_name") or f"Thread {thread_id}"
+                current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
+                current_color = thread.get("current_title_color", "#111111")
+                status = thread.get("status", "active")
+
+                with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
+                    top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
+                    if top_controls[0].button("Up", key=f"move_up_{thread_id}", disabled=read_only or idx == 0):
+                        mutate_threads(
+                            lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
+                            "Move thread up",
+                        )
+                    if top_controls[1].button("Down", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1):
+                        mutate_threads(
+                            lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, 1)}),
+                            "Move thread down",
+                        )
+                    track_now = status == "active"
+                    track_new = top_controls[2].toggle("track", value=track_now, key=f"track_{thread_id}", disabled=read_only)
+                    if track_new != track_now and not read_only:
+                        mutate_threads(
+                            lambda doc: [
+                                t.update({"status": "active" if track_new else "paused"})
+                                for t in doc.get("threads", [])
+                                if t.get("id") == thread_id
+                            ],
+                            "Toggle thread tracking",
+                        )
+                    if top_controls[3].button("Refresh", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id")):
                         execute_update(
                             github,
                             config,
                             threads_payload,
                             runtime,
-                            selected_thread_ids={tid},
-                            reason=f"refresh_thread_{tid}",
-                        ),
-                        st.rerun(),
-                    ),
-                )
+                            selected_thread_ids={thread_id},
+                            reason=f"refresh_thread_{thread_id}",
+                        )
+                        st.rerun()
+                    if top_controls[4].button("Reset", key=f"reset_{thread_id}", disabled=read_only):
+                        payload, sha = load_sample_payload(github, thread)
+                        payload["samples"] = []
+                        github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
+                        st.rerun()
+                    if top_controls[5].button("Remove", key=f"remove_{thread_id}", disabled=read_only):
+                        mutate_threads(
+                            lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
+                            "Remove thread",
+                        )
+
+                    include_now = bool(thread.get("include_in_adhoc", True))
+                    include_new = st.toggle(
+                        "Include in selected ad hoc refresh",
+                        value=include_now,
+                        key=f"adhoc_{thread_id}",
+                        disabled=read_only,
+                    )
+                    if include_new != include_now and not read_only:
+                        mutate_threads(
+                            lambda doc: [
+                                t.update({"include_in_adhoc": bool(include_new)})
+                                for t in doc.get("threads", [])
+                                if t.get("id") == thread_id
+                            ],
+                            "Toggle ad hoc inclusion",
+                        )
+
+                    current_id = str(thread.get("thread_numeric_id") or "")
+                    new_id = st.text_input("Thread URL or numeric ID", value=current_id, key=f"thread_id_edit_{thread_id}")
+                    if st.button("Save thread ID", key=f"save_thread_id_{thread_id}", disabled=read_only):
+                        numeric = parse_thread_numeric_id(new_id)
+                        if not numeric:
+                            st.error("Invalid URL/ID")
+                        else:
+                            mutate_threads(
+                                lambda doc: [
+                                    t.update({"thread_numeric_id": str(numeric)})
+                                    for t in doc.get("threads", [])
+                                    if t.get("id") == thread_id
+                                ],
+                                "Update thread numeric id",
+                            )
+
+                    if not chart_opts["graph_only"]:
+                        st.write(
+                            f"**Current title:** <span style='color:{current_color};'>{current_title}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(subforum_name_map.get(thread.get("subforum_key"), thread.get("subforum_key", "Unknown")))
+                        st.write(f"Last views: `{thread.get('last_view_count', 'N/A')}`")
+                        if thread.get("last_found_page") is not None:
+                            st.write(
+                                f"Last location: page {thread.get('last_found_page')} | threads above: {thread.get('last_found_above', 'N/A')}"
+                            )
+                        st.write(f"Last seen: {to_ny_24h(thread.get('last_seen_at'))}")
+                        render_title_legend(thread)
+
+                    payload = load_samples(source, thread_id)
+                    samples = payload.get("samples", [])
+                    if not samples:
+                        st.info("No samples recorded")
+                        continue
+
+                    df = pd.DataFrame(samples)
+                    df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
+                    df = df.dropna(subset=["ts", "views"]).copy()
+                    if df.empty:
+                        st.info("No valid samples")
+                        continue
+
+                    if "title_color" not in df.columns:
+                        df["title_color"] = "#1f77b4"
+                    df["title_color"] = df["title_color"].fillna("#1f77b4")
+
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df["ts"],
+                            y=df["views"],
+                            mode=chart_opts["mode"],
+                            line={"shape": chart_opts["line_shape"], "width": chart_opts["line_width"], "color": "#444444"},
+                            marker={"size": chart_opts["marker_size"], "color": df["title_color"]},
+                            name="Views",
+                        )
+                    )
+                    dtick_ms = choose_dtick_ms(df["ts"])
+                    fig.update_layout(
+                        height=640,
+                        margin={"l": 10, "r": 10, "t": 45, "b": 10},
+                        title={"text": current_title, "x": 0.02, "xanchor": "left"},
+                        xaxis_title="Timestamp (America/New_York)",
+                        yaxis_title="Views",
+                    )
+                    xaxis_cfg: dict[str, Any] = {
+                        "tickformat": "%H:%M\n%Y-%m-%d",
+                        "hoverformat": "%Y-%m-%d %H:%M:%S",
+                    }
+                    if dtick_ms is not None:
+                        xaxis_cfg["dtick"] = dtick_ms
+                    fig.update_xaxes(**xaxis_cfg)
+                    fig.update_yaxes(type=chart_opts["y_scale"])
+                    if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
+                        fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
+                    st.plotly_chart(fig, use_container_width=True)
 
     with main_tabs[1]:
-        st.subheader("History Table")
-        threads = threads_payload.get("threads", [])
-        history_df, color_lookup = build_history_table(source, threads)
-        if history_df.empty:
-            st.info("No samples available")
-        else:
-            styled = style_history(history_df, color_lookup)
-            st.dataframe(styled, use_container_width=True)
+        history_df, color_lookup = build_history_table(source, sorted_threads(threads_payload))
+        render_history_html(history_df, color_lookup)
+
+    with main_tabs[2]:
+        with st.expander("Runtime Events", expanded=False):
+            events = runtime.get("events", [])
+            if events:
+                events_df = pd.DataFrame(events[-80:])
+                events_df["ts"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
+                events_df["ts"] = events_df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                st.dataframe(events_df[["ts", "level", "message"]], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No runtime events yet")
 
 
 if __name__ == "__main__":
@@ -934,4 +975,12 @@ if __name__ == "__main__":
         main()
     except Exception as exc:  # noqa: BLE001
         _, github, _, _ = build_clients()
-        log_ui_error(github, exc)
+        if github:
+            try:
+                payload, sha = github.get_file("data/ui_errors.json")
+            except Exception:  # noqa: BLE001
+                payload, sha = {"errors": []}, None
+            payload.setdefault("errors", []).append({"ts": utc_now(), "error": str(exc), "traceback": traceback.format_exc()})
+            github.put_file("data/ui_errors.json", payload, "Log UI error", sha)
+        st.error("Unexpected error")
+        st.exception(exc)
