@@ -545,7 +545,7 @@ def main() -> None:
     render_status(config, runtime)
 
     st.sidebar.header("Controls")
-    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Export"])
+    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Stats", "Export"])
 
     with side_tabs[3]:
         st.subheader("Display options")
@@ -780,6 +780,33 @@ def main() -> None:
                         st.session_state["threads_override"] = threads
                         st.rerun()
 
+        st.divider()
+        st.subheader("Edit thread numeric ID")
+        thread_options = sorted_threads(threads_payload)
+        if not thread_options:
+            st.caption("No threads available")
+        else:
+            option_labels = {
+                f"{t.get('display_name') or t.get('id')} ({t.get('thread_numeric_id') or 'MISSING'})": t.get("id")
+                for t in thread_options
+            }
+            selected_label = st.selectbox("Thread", options=list(option_labels.keys()), key="edit_thread_select")
+            replacement_raw = st.text_input("Replacement URL or numeric ID", key="edit_thread_numeric_id")
+            if st.button("Save replacement ID", disabled=read_only):
+                numeric = parse_thread_numeric_id(replacement_raw)
+                if not numeric:
+                    st.error("Invalid URL/ID")
+                else:
+                    selected_id = option_labels[selected_label]
+                    mutate_doc, sha = github.get_file("data/threads.json")
+                    for thread in mutate_doc.get("threads", []):
+                        if thread.get("id") == selected_id:
+                            thread["thread_numeric_id"] = str(numeric)
+                            break
+                    github.put_file("data/threads.json", mutate_doc, "Update thread numeric id", sha)
+                    st.session_state["threads_override"] = mutate_doc.get("threads", [])
+                    st.rerun()
+
     with side_tabs[2]:
         st.subheader("Subforum retrieval limits")
         rows = [{"Subforum": s["name"], "Max pages": int(s.get("max_pages_per_update", 3))} for s in config.get("subforums", [])]
@@ -800,6 +827,22 @@ def main() -> None:
             st.rerun()
 
     with side_tabs[4]:
+        st.subheader("Thread update counts")
+        stats_rows = []
+        for thread in sorted_threads(threads_payload):
+            count = len(load_samples(source, thread["id"]).get("samples", []))
+            stats_rows.append(
+                {
+                    "Thread": thread.get("display_name") or thread.get("id"),
+                    "Updates": count,
+                }
+            )
+        if stats_rows:
+            st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No thread data yet")
+
+    with side_tabs[5]:
         st.subheader("Export")
         export_threads = []
         for thread in sorted_threads(threads_payload):
@@ -865,87 +908,71 @@ def main() -> None:
                 current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
-                sample_count_preview = len(load_samples(source, thread_id).get("samples", []))
 
                 with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
-                    top_controls = st.columns([1.2, 1, 1, 1, 1, 1, 0.7])
-                    if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
-                        mutate_threads(
-                            lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
-                            "Move thread up",
-                        )
-                    if top_controls[1].button("▼", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1, help="Move down"):
-                        mutate_threads(
-                            lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, 1)}),
-                            "Move thread down",
-                        )
-                    track_now = status == "active"
-                    track_new = top_controls[2].toggle("⏻", value=track_now, key=f"track_{thread_id}", disabled=read_only, help="Track on/off")
-                    if track_new != track_now and not read_only:
-                        mutate_threads(
-                            lambda doc: [
-                                t.update({"status": "active" if track_new else "paused"})
-                                for t in doc.get("threads", [])
-                                if t.get("id") == thread_id
-                            ],
-                            "Toggle thread tracking",
-                        )
-                    if top_controls[3].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
-                        execute_update(
-                            github,
-                            config,
-                            threads_payload,
-                            runtime,
-                            selected_thread_ids={thread_id},
-                            reason=f"refresh_thread_{thread_id}",
-                        )
-                        st.session_state["threads_override"] = threads_payload.get("threads", [])
-                        st.rerun()
-                    if top_controls[4].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
-                        payload, sha = load_sample_payload(github, thread)
-                        payload["samples"] = []
-                        github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
-                        st.rerun()
-                    if top_controls[5].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
-                        mutate_threads(
-                            lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
-                            "Remove thread",
-                        )
-                    top_controls[6].markdown(f"### {sample_count_preview}")
-
-                    include_now = bool(thread.get("include_in_adhoc", True))
-                    include_new = st.toggle(
-                        "◎",
-                        value=include_now,
-                        key=f"adhoc_{thread_id}",
-                        disabled=read_only,
-                        help="Include in selected ad hoc refresh",
-                    )
-                    st.caption("⏻ = track, ◎ = include in selected refresh")
-                    if include_new != include_now and not read_only:
-                        mutate_threads(
-                            lambda doc: [
-                                t.update({"include_in_adhoc": bool(include_new)})
-                                for t in doc.get("threads", [])
-                                if t.get("id") == thread_id
-                            ],
-                            "Toggle ad hoc inclusion",
-                        )
-
-                    current_id = str(thread.get("thread_numeric_id") or "")
-                    new_id = st.text_input("Thread URL or numeric ID", value=current_id, key=f"thread_id_edit_{thread_id}")
-                    if st.button("Save thread ID", key=f"save_thread_id_{thread_id}", disabled=read_only):
-                        numeric = parse_thread_numeric_id(new_id)
-                        if not numeric:
-                            st.error("Invalid URL/ID")
-                        else:
+                    controls_expanded = not chart_opts["graph_only"]
+                    with st.expander("Controls", expanded=controls_expanded):
+                        top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
+                        if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
+                            mutate_threads(
+                                lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
+                                "Move thread up",
+                            )
+                        if top_controls[1].button("▼", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1, help="Move down"):
+                            mutate_threads(
+                                lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, 1)}),
+                                "Move thread down",
+                            )
+                        track_now = status == "active"
+                        track_new = top_controls[2].toggle("⏻", value=track_now, key=f"track_{thread_id}", disabled=read_only, help="Track on/off")
+                        if track_new != track_now and not read_only:
                             mutate_threads(
                                 lambda doc: [
-                                    t.update({"thread_numeric_id": str(numeric)})
+                                    t.update({"status": "active" if track_new else "paused"})
                                     for t in doc.get("threads", [])
                                     if t.get("id") == thread_id
                                 ],
-                                "Update thread numeric id",
+                                "Toggle thread tracking",
+                            )
+                        if top_controls[3].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
+                            execute_update(
+                                github,
+                                config,
+                                threads_payload,
+                                runtime,
+                                selected_thread_ids={thread_id},
+                                reason=f"refresh_thread_{thread_id}",
+                            )
+                            st.session_state["threads_override"] = threads_payload.get("threads", [])
+                            st.rerun()
+                        if top_controls[4].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
+                            payload, sha = load_sample_payload(github, thread)
+                            payload["samples"] = []
+                            github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
+                            st.rerun()
+                        if top_controls[5].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
+                            mutate_threads(
+                                lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
+                                "Remove thread",
+                            )
+
+                        include_now = bool(thread.get("include_in_adhoc", True))
+                        include_new = st.toggle(
+                            "◎",
+                            value=include_now,
+                            key=f"adhoc_{thread_id}",
+                            disabled=read_only,
+                            help="Include in selected ad hoc refresh",
+                        )
+                        st.caption("⏻ = track, ◎ = include in selected refresh")
+                        if include_new != include_now and not read_only:
+                            mutate_threads(
+                                lambda doc: [
+                                    t.update({"include_in_adhoc": bool(include_new)})
+                                    for t in doc.get("threads", [])
+                                    if t.get("id") == thread_id
+                                ],
+                                "Toggle ad hoc inclusion",
                             )
 
                     if not chart_opts["graph_only"]:
@@ -982,68 +1009,70 @@ def main() -> None:
                     df = df.sort_values("ts").reset_index(drop=True)
                     initial_upper = df["ts"].iloc[-1]
                     initial_lower = df["ts"].iloc[0]
-                    range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
-                    upper_mode = range_cols[0].selectbox(
-                        "↑",
-                        options=["Latest", "Manual"],
-                        index=0,
-                        key=f"x_upper_mode_{thread_id}",
-                        help="Upper x bound mode",
-                    )
-                    lower_mode = range_cols[1].selectbox(
-                        "↓",
-                        options=["Window", "Manual"],
-                        index=0,
-                        key=f"x_lower_mode_{thread_id}",
-                        help="Lower x bound mode",
-                    )
-                    window_points = int(
-                        range_cols[2].number_input(
-                            "N",
-                            min_value=1,
-                            max_value=5000,
-                            value=25,
-                            step=1,
-                            key=f"x_window_points_{thread_id}",
-                            help="Past points before current upper point",
+                    range_expanded = not chart_opts["graph_only"]
+                    with st.expander("X Range", expanded=range_expanded):
+                        range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
+                        upper_mode = range_cols[0].selectbox(
+                            "↑",
+                            options=["Latest", "Manual"],
+                            index=0,
+                            key=f"x_upper_mode_{thread_id}",
+                            help="Upper x bound mode",
                         )
-                    )
+                        lower_mode = range_cols[1].selectbox(
+                            "↓",
+                            options=["Window", "Manual"],
+                            index=0,
+                            key=f"x_lower_mode_{thread_id}",
+                            help="Lower x bound mode",
+                        )
+                        window_points = int(
+                            range_cols[2].number_input(
+                                "N",
+                                min_value=1,
+                                max_value=5000,
+                                value=25,
+                                step=1,
+                                key=f"x_window_points_{thread_id}",
+                                help="Past points before current upper point",
+                            )
+                        )
 
-                    default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
-                    default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
-                    manual_upper_date = range_cols[3].date_input(
-                        "Upper D",
-                        value=default_upper_dt.date(),
-                        key=f"x_upper_date_{thread_id}",
-                        disabled=upper_mode != "Manual",
-                    )
-                    manual_upper_time = range_cols[3].time_input(
-                        "Upper T",
-                        value=default_upper_dt.time(),
-                        key=f"x_upper_time_{thread_id}",
-                        disabled=upper_mode != "Manual",
-                    )
-                    manual_lower_date = range_cols[4].date_input(
-                        "Lower D",
-                        value=default_lower_dt.date(),
-                        key=f"x_lower_date_{thread_id}",
-                        disabled=lower_mode != "Manual",
-                    )
-                    manual_lower_time = range_cols[4].time_input(
-                        "Lower T",
-                        value=default_lower_dt.time(),
-                        key=f"x_lower_time_{thread_id}",
-                        disabled=lower_mode != "Manual",
-                    )
-                    if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
-                        st.session_state[f"x_upper_mode_{thread_id}"] = "Latest"
-                        st.session_state[f"x_lower_mode_{thread_id}"] = "Window"
-                        st.session_state[f"x_window_points_{thread_id}"] = 25
-                        st.session_state[f"x_upper_date_{thread_id}"] = default_upper_dt.date()
-                        st.session_state[f"x_upper_time_{thread_id}"] = default_upper_dt.time()
-                        st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
-                        st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
-                        st.rerun()
+                        default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
+                        default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
+                        manual_upper_date = range_cols[3].date_input(
+                            "Upper D",
+                            value=default_upper_dt.date(),
+                            key=f"x_upper_date_{thread_id}",
+                            disabled=upper_mode != "Manual",
+                        )
+                        manual_upper_time = range_cols[3].time_input(
+                            "Upper T",
+                            value=default_upper_dt.time(),
+                            key=f"x_upper_time_{thread_id}",
+                            disabled=upper_mode != "Manual",
+                        )
+                        manual_lower_date = range_cols[4].date_input(
+                            "Lower D",
+                            value=default_lower_dt.date(),
+                            key=f"x_lower_date_{thread_id}",
+                            disabled=lower_mode != "Manual",
+                        )
+                        manual_lower_time = range_cols[4].time_input(
+                            "Lower T",
+                            value=default_lower_dt.time(),
+                            key=f"x_lower_time_{thread_id}",
+                            disabled=lower_mode != "Manual",
+                        )
+                        if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
+                            st.session_state[f"x_upper_mode_{thread_id}"] = "Latest"
+                            st.session_state[f"x_lower_mode_{thread_id}"] = "Window"
+                            st.session_state[f"x_window_points_{thread_id}"] = 25
+                            st.session_state[f"x_upper_date_{thread_id}"] = default_upper_dt.date()
+                            st.session_state[f"x_upper_time_{thread_id}"] = default_upper_dt.time()
+                            st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
+                            st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
+                            st.rerun()
 
                     upper_ts = initial_upper
                     if upper_mode == "Manual":
