@@ -173,8 +173,8 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _group_active_threads(threads: list[dict[str, Any]], selected_thread_ids: set[str] | None) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
+def _ordered_active_threads(threads: list[dict[str, Any]], selected_thread_ids: set[str] | None) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
     for thread in threads:
         if thread.get("status", "active") != "active":
             continue
@@ -182,8 +182,8 @@ def _group_active_threads(threads: list[dict[str, Any]], selected_thread_ids: se
             continue
         if selected_thread_ids and thread.get("id") not in selected_thread_ids:
             continue
-        grouped.setdefault(thread["subforum_key"], []).append(thread)
-    return grouped
+        active.append(thread)
+    return sorted(active, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
 
 
 def run_update(
@@ -206,9 +206,11 @@ def run_update(
     if max_delay < min_delay:
         max_delay = min_delay
 
-    grouped = _group_active_threads(threads_payload.get("threads", []), selected_thread_ids)
+    active_threads = _ordered_active_threads(threads_payload.get("threads", []), selected_thread_ids)
     subforums = {x["key"]: x for x in config.get("subforums", [])}
     samples_updates: dict[str, dict[str, Any]] = {}
+    page_cache: dict[str, dict[int, dict[str, dict[str, Any]]]] = {}
+    subforum_failed: set[str] = set()
 
     recent_calls: list[float] = []
     last_call_at: float | None = None
@@ -237,90 +239,92 @@ def run_update(
 
     session = requests.Session()
 
-    for subforum_key, sub_threads in grouped.items():
+    for thread in active_threads:
+        subforum_key = str(thread.get("subforum_key"))
         subforum = subforums.get(subforum_key)
         if not subforum:
             errors.append({"subforum_key": subforum_key, "error": "Unknown subforum"})
             continue
 
-        target_by_numeric_id = {str(t["thread_numeric_id"]): t for t in sub_threads}
-        pending_ids = set(target_by_numeric_id.keys())
+        if subforum_key in subforum_failed:
+            continue
+
+        numeric_id = str(thread.get("thread_numeric_id"))
         max_pages = int(subforum.get("max_pages_per_update", 3))
 
         for page in range(1, max_pages + 1):
-            if not pending_ids:
-                break
-            if set_action:
-                set_action(f"Fetching {subforum['name']} page {page}")
-
-            url = build_page_url(subforum["url"], page)
-            html = None
-            for attempt in range(max_retries + 1):
-                try:
-                    wait_budget()
-                    requests_made += 1
-                    resp = session.get(url, headers=_headers(), timeout=20)
-                    if resp.status_code in {403, 429}:
-                        time.sleep(6 + attempt * 4)
-                    resp.raise_for_status()
-                    html = resp.text
+            subforum_pages = page_cache.setdefault(subforum_key, {})
+            by_id = subforum_pages.get(page)
+            if by_id is None:
+                if set_action:
+                    set_action(f"Fetching {subforum['name']} page {page}")
+                url = build_page_url(subforum["url"], page)
+                html = None
+                for attempt in range(max_retries + 1):
+                    try:
+                        wait_budget()
+                        requests_made += 1
+                        resp = session.get(url, headers=_headers(), timeout=20)
+                        if resp.status_code in {403, 429}:
+                            time.sleep(6 + attempt * 4)
+                        resp.raise_for_status()
+                        html = resp.text
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if attempt >= max_retries:
+                            errors.append(
+                                {
+                                    "subforum_key": subforum_key,
+                                    "error": f"Fetch failed ({url}): {exc}",
+                                }
+                            )
+                        else:
+                            time.sleep(2 + attempt * 2)
+                if html is None:
+                    subforum_failed.add(subforum_key)
                     break
-                except Exception as exc:  # noqa: BLE001
-                    if attempt >= max_retries:
-                        errors.append(
-                            {
-                                "subforum_key": subforum_key,
-                                "error": f"Fetch failed ({url}): {exc}",
-                            }
-                        )
-                    else:
-                        time.sleep(2 + attempt * 2)
-            if html is None:
-                break
+                listing_rows = parse_listing_rows(html)
+                by_id = {row["thread_numeric_id"]: row for row in listing_rows}
+                subforum_pages[page] = by_id
 
-            listing_rows = parse_listing_rows(html)
-            by_id = {row["thread_numeric_id"]: row for row in listing_rows}
-            for numeric_id in list(pending_ids):
-                row = by_id.get(numeric_id)
-                if not row:
-                    continue
-                if row.get("views") is None:
-                    continue
-                thread = target_by_numeric_id[numeric_id]
-                thread["last_seen_at"] = utc_now()
-                thread["last_view_count"] = int(row["views"])
-                thread["last_found_page"] = page
-                thread["last_found_above"] = row.get("position")
-                if row.get("title"):
-                    thread["last_seen_title"] = row["title"]
+            row = by_id.get(numeric_id)
+            if not row or row.get("views") is None:
+                continue
 
-                thread_id = thread["id"]
-                payload = samples_updates.setdefault(
-                    thread_id,
-                    {
-                        "thread_id": thread_id,
-                        "title": thread.get("display_name") or thread.get("title") or f"Thread {numeric_id}",
-                        "thread_numeric_id": numeric_id,
-                        "samples": [],
-                    },
-                )
-                payload["samples"].append(
-                    {
-                        "ts": utc_now(),
-                        "views": int(row["views"]),
-                        "page": page,
-                        "above": row.get("position"),
-                        "observed_title": row.get("title"),
-                    }
-                )
-                updated_threads += 1
-                pending_ids.discard(numeric_id)
+            thread["last_seen_at"] = utc_now()
+            thread["last_view_count"] = int(row["views"])
+            thread["last_found_page"] = page
+            thread["last_found_above"] = row.get("position")
+            if row.get("title"):
+                thread["last_seen_title"] = row["title"]
+
+            thread_id = thread["id"]
+            payload = samples_updates.setdefault(
+                thread_id,
+                {
+                    "thread_id": thread_id,
+                    "title": thread.get("display_name") or thread.get("title") or f"Thread {numeric_id}",
+                    "thread_numeric_id": numeric_id,
+                    "samples": [],
+                },
+            )
+            payload["samples"].append(
+                {
+                    "ts": utc_now(),
+                    "views": int(row["views"]),
+                    "page": page,
+                    "above": row.get("position"),
+                    "observed_title": row.get("title"),
+                }
+            )
+            updated_threads += 1
+            break
 
     finished_at = utc_now()
     result = UpdateResult(
         started_at=started_at,
         finished_at=finished_at,
-        checked_threads=sum(len(v) for v in grouped.values()),
+        checked_threads=len(active_threads),
         updated_threads=updated_threads,
         requests_made=requests_made,
         errors=errors,
