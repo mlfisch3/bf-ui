@@ -296,6 +296,7 @@ def run_update(
                         "views": int(row["views"]),
                         "page": page,
                         "above": row.get("position"),
+                        "observed_title": row.get("title"),
                     }
                 )
                 updated_threads += 1
