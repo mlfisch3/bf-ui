@@ -12,6 +12,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+try:
+    from streamlit_sortables import sort_items
+except Exception:  # noqa: BLE001
+    sort_items = None
 
 from ui.data_client import DataSource, fetch_json
 from ui.github_client import GithubClient, GithubConfig
@@ -495,6 +499,46 @@ def sorted_threads(threads_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
 
 
+def thread_label(thread: dict[str, Any]) -> str:
+    return str(thread.get("display_name") or thread.get("current_title") or thread.get("id"))
+
+
+def sync_layout_rows(threads: list[dict[str, Any]], rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    existing = {str(item.get("thread_id")): item for item in (rows or [])}
+    ordered: list[dict[str, Any]] = []
+    for thread in threads:
+        thread_id = str(thread.get("id"))
+        current = existing.get(thread_id, {})
+        ordered.append(
+            {
+                "thread_id": thread_id,
+                "show_card": bool(current.get("show_card", True)),
+                "show_x_range": bool(current.get("show_x_range", False)),
+            }
+        )
+    return ordered
+
+
+def sync_tracker_rows(threads: list[dict[str, Any]], rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    existing = {str(item.get("thread_id")): item for item in (rows or [])}
+    ordered: list[dict[str, Any]] = []
+    for thread in threads:
+        thread_id = str(thread.get("id"))
+        current = existing.get(thread_id, {})
+        ordered.append(
+            {
+                "thread_id": thread_id,
+                "track": bool(current.get("track", thread.get("status", "active") == "active")),
+                "adhoc": bool(current.get("adhoc", thread.get("include_in_adhoc", True))),
+            }
+        )
+    return ordered
+
+
+def rows_dirty(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
+    return json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True)
+
+
 def move_thread_order(threads: list[dict[str, Any]], thread_id: str, delta: int) -> list[dict[str, Any]]:
     ordered = sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
     idx = next((i for i, t in enumerate(ordered) if t.get("id") == thread_id), None)
@@ -547,9 +591,6 @@ def main() -> None:
     source, github, repo, branch = build_clients()
     read_only = github is None
 
-    st.title("BladeForums View Tracker")
-    st.caption(f"Tracker repo: {repo} ({branch})")
-
     try:
         force_reload = bool(st.session_state.pop("force_reload_docs", False))
         config, threads_payload, runtime = init_session_docs(source, force_reload=force_reload)
@@ -588,12 +629,16 @@ def main() -> None:
     if state == "running":
         st_autorefresh(interval=15000, key="tracker_refresh")
 
-    render_status(config, runtime)
+    threads_sorted = sorted_threads(threads_payload)
+    st.session_state["layout_applied"] = sync_layout_rows(threads_sorted, st.session_state.get("layout_applied"))
+    st.session_state["layout_draft"] = sync_layout_rows(threads_sorted, st.session_state.get("layout_draft"))
+    st.session_state["tracker_applied"] = sync_tracker_rows(threads_sorted, st.session_state.get("tracker_applied"))
+    st.session_state["tracker_draft"] = sync_tracker_rows(threads_sorted, st.session_state.get("tracker_draft"))
 
     st.sidebar.header("Controls")
-    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Subforums", "Display", "Stats", "Export"])
+    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Layout", "Subforums", "Display", "Stats", "Export"])
 
-    with side_tabs[3]:
+    with side_tabs[4]:
         st.subheader("Display options")
         style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
         line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0, key="disp_line_shape")
@@ -619,7 +664,6 @@ def main() -> None:
                 value=True,
                 key="disp_auto_fit_mobile",
             )
-        expanded_default = st.toggle("Expand thread cards by default", value=True, key="disp_expand_cards")
         auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
         y_min = y_max = None
         if not auto_y:
@@ -637,10 +681,13 @@ def main() -> None:
             "graph_only": graph_only,
             "cards_per_row": cards_per_row,
             "auto_fit_mobile": auto_fit_mobile,
-            "expanded_default": expanded_default,
         }
 
     with side_tabs[0]:
+        st.subheader("BladeForums View Tracker")
+        st.caption(f"Tracker repo: {repo} ({branch})")
+        render_status(config, runtime)
+        st.divider()
         interval_seconds = int(tracker_cfg.get("interval_seconds", 1800))
         run_immediately = bool(tracker_cfg.get("start_immediately", True))
 
@@ -849,8 +896,8 @@ def main() -> None:
                                 "display_name": label,
                                 "thread_numeric_id": str(numeric),
                                 "subforum_key": subforum_key,
-                                "status": "active",
-                                "include_in_adhoc": True,
+                                "status": "paused",
+                                "include_in_adhoc": False,
                                 "order": order_val,
                                 "created_at": utc_now(),
                                 "title_history": [],
@@ -860,6 +907,9 @@ def main() -> None:
                         threads_doc["threads"] = threads
                         github.put_file("data/threads.json", threads_doc, "Add tracked thread", sha)
                         st.session_state["threads_override"] = threads
+                        pending_ids = set(st.session_state.get("pending_registration_ids", []))
+                        pending_ids.add(new_id)
+                        st.session_state["pending_registration_ids"] = sorted(pending_ids)
                         store_session_docs(threads_payload=threads_doc)
                         st.rerun()
 
@@ -891,7 +941,112 @@ def main() -> None:
                     store_session_docs(threads_payload=mutate_doc)
                     st.rerun()
 
+        st.divider()
+        st.subheader("Tracking & Ad Hoc Selection")
+        thread_map = {str(t["id"]): t for t in sorted_threads(threads_payload)}
+        tracker_applied = sync_tracker_rows(sorted_threads(threads_payload), st.session_state.get("tracker_applied"))
+        tracker_draft = sync_tracker_rows(sorted_threads(threads_payload), st.session_state.get("tracker_draft"))
+        st.session_state["tracker_applied"] = tracker_applied
+        st.session_state["tracker_draft"] = tracker_draft
+
+        draft_ids = [row["thread_id"] for row in tracker_draft]
+        if sort_items and draft_ids:
+            label_to_id = {f"{thread_label(thread_map[item_id])} [{item_id[:7]}]": item_id for item_id in draft_ids if item_id in thread_map}
+            sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="threads_sort_panel")
+            ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
+            ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+        else:
+            ordered_ids = draft_ids
+            if not sort_items:
+                st.caption("Drag-and-drop is unavailable (sortable component missing).")
+
+        updated_tracker_rows: list[dict[str, Any]] = []
+        panel = st.container(border=True)
+        with panel:
+            for thread_id in ordered_ids:
+                row = next((x for x in tracker_draft if x["thread_id"] == thread_id), None)
+                if not row or thread_id not in thread_map:
+                    continue
+                cols = st.columns([0.8, 0.8, 3.8])
+                track_val = cols[0].toggle("T", value=bool(row.get("track", False)), key=f"tracker_track_{thread_id}", help="Track")
+                adhoc_val = cols[1].toggle("A", value=bool(row.get("adhoc", True)), key=f"tracker_adhoc_{thread_id}", help="Include in ad hoc")
+                cols[2].caption(thread_label(thread_map[thread_id]))
+                updated_tracker_rows.append({"thread_id": thread_id, "track": bool(track_val), "adhoc": bool(adhoc_val)})
+
+        st.session_state["tracker_draft"] = updated_tracker_rows
+        pending_registration_ids = set(st.session_state.get("pending_registration_ids", []))
+        tracker_is_dirty = rows_dirty(updated_tracker_rows, tracker_applied) or bool(pending_registration_ids)
+        if tracker_is_dirty:
+            if st.button("Apply Thread Settings", disabled=read_only):
+                by_id = {row["thread_id"]: row for row in updated_tracker_rows}
+                threads_doc, sha = github.get_file("data/threads.json")
+                ordered_threads: list[dict[str, Any]] = []
+                for idx, thread_id in enumerate([row["thread_id"] for row in updated_tracker_rows]):
+                    thread = next((t for t in threads_doc.get("threads", []) if str(t.get("id")) == str(thread_id)), None)
+                    if not thread:
+                        continue
+                    row = by_id.get(str(thread_id), {"track": False, "adhoc": False})
+                    thread["status"] = "active" if bool(row.get("track")) else "paused"
+                    thread["include_in_adhoc"] = bool(row.get("adhoc"))
+                    thread["order"] = idx
+                    ordered_threads.append(thread)
+                # Keep any missing threads at the end to avoid accidental drops.
+                existing_ids = {str(t.get("id")) for t in ordered_threads}
+                for tail in threads_doc.get("threads", []):
+                    if str(tail.get("id")) in existing_ids:
+                        continue
+                    tail["order"] = len(ordered_threads)
+                    ordered_threads.append(tail)
+                threads_doc["threads"] = ordered_threads
+                github.put_file("data/threads.json", threads_doc, "Apply thread panel settings", sha)
+                st.session_state["threads_override"] = ordered_threads
+                st.session_state["tracker_applied"] = _deepcopy_doc(updated_tracker_rows)
+                active_pending = {x["thread_id"] for x in updated_tracker_rows if x["thread_id"] in pending_registration_ids and x.get("track")}
+                pending_registration_ids = pending_registration_ids.difference(active_pending)
+                st.session_state["pending_registration_ids"] = sorted(pending_registration_ids)
+                store_session_docs(threads_payload=threads_doc)
+                st.rerun()
+
     with side_tabs[2]:
+        st.subheader("Thread Cards Layout")
+        threads_for_layout = sorted_threads(threads_payload)
+        thread_map = {str(t["id"]): t for t in threads_for_layout}
+        layout_applied = sync_layout_rows(threads_for_layout, st.session_state.get("layout_applied"))
+        layout_draft = sync_layout_rows(threads_for_layout, st.session_state.get("layout_draft"))
+        st.session_state["layout_applied"] = layout_applied
+        st.session_state["layout_draft"] = layout_draft
+
+        draft_ids = [row["thread_id"] for row in layout_draft]
+        if sort_items and draft_ids:
+            label_to_id = {f"{thread_label(thread_map[item_id])} [{item_id[:7]}]": item_id for item_id in draft_ids if item_id in thread_map}
+            sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="layout_sort_panel")
+            ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
+            ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+        else:
+            ordered_ids = draft_ids
+            if not sort_items:
+                st.caption("Drag-and-drop is unavailable (sortable component missing).")
+
+        updated_layout_rows: list[dict[str, Any]] = []
+        panel = st.container(border=True)
+        with panel:
+            for thread_id in ordered_ids:
+                row = next((x for x in layout_draft if x["thread_id"] == thread_id), None)
+                if not row or thread_id not in thread_map:
+                    continue
+                cols = st.columns([0.8, 0.8, 3.8])
+                show_card = cols[0].toggle("C", value=bool(row.get("show_card", True)), key=f"layout_show_{thread_id}", help="Show card")
+                show_x = cols[1].toggle("X", value=bool(row.get("show_x_range", False)), key=f"layout_x_{thread_id}", help="Show X range controls")
+                cols[2].caption(thread_label(thread_map[thread_id]))
+                updated_layout_rows.append({"thread_id": thread_id, "show_card": bool(show_card), "show_x_range": bool(show_x)})
+
+        st.session_state["layout_draft"] = updated_layout_rows
+        if rows_dirty(updated_layout_rows, layout_applied):
+            if st.button("Apply Layout"):
+                st.session_state["layout_applied"] = _deepcopy_doc(updated_layout_rows)
+                st.rerun()
+
+    with side_tabs[3]:
         st.subheader("Subforum retrieval limits")
         st.caption("Increase max pages if a tracked thread has moved deeper in a subforum.")
         apply_all_cols = st.columns([1.2, 1])
@@ -924,7 +1079,7 @@ def main() -> None:
             put_json(github, "data/config.json", config, "Update subforum limits")
             store_session_docs(config=config)
 
-    with side_tabs[4]:
+    with side_tabs[5]:
         st.subheader("Thread update counts")
         stats_rows = []
         for thread in sorted_threads(threads_payload):
@@ -940,7 +1095,7 @@ def main() -> None:
         else:
             st.caption("No thread data yet")
 
-    with side_tabs[5]:
+    with side_tabs[6]:
         st.subheader("Export")
         export_threads = []
         for thread in sorted_threads(threads_payload):
@@ -1001,101 +1156,46 @@ def main() -> None:
         else:
             subforum_name_map = {x["key"]: x["name"] for x in config.get("subforums", [])}
 
-            def render_thread(idx: int, thread: dict[str, Any]) -> None:
+            layout_applied_rows = st.session_state.get("layout_applied", [])
+            layout_by_id = {str(row.get("thread_id")): row for row in layout_applied_rows}
+
+            def render_thread(thread: dict[str, Any]) -> None:
                 thread_id = thread["id"]
                 display_name = thread.get("display_name") or f"Thread {thread_id}"
                 current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
-                card_expanded_key = f"card_expanded_{thread_id}"
-                if card_expanded_key not in st.session_state:
-                    st.session_state[card_expanded_key] = bool(chart_opts["expanded_default"])
-
-                with st.expander(f"{display_name} ({status})", expanded=bool(st.session_state[card_expanded_key])):
-                    card_expanded = st.toggle(
-                        "Expanded",
-                        value=bool(st.session_state[card_expanded_key]),
-                        key=f"{card_expanded_key}_toggle",
-                    )
-                    st.session_state[card_expanded_key] = bool(card_expanded)
-                    if not card_expanded:
-                        return
-                    controls_expanded = not chart_opts["graph_only"]
-                    show_controls = st.toggle(
-                        "Show controls",
-                        value=controls_expanded,
-                        key=f"show_controls_{thread_id}",
-                    )
-                    if show_controls:
-                        top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
-                        if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
-                            mutate_threads(
-                                lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
-                                "Move thread up",
-                            )
-                        if top_controls[1].button("▼", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1, help="Move down"):
-                            mutate_threads(
-                                lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, 1)}),
-                                "Move thread down",
-                            )
-                        track_now = status == "active"
-                        track_new = top_controls[2].toggle("⏻", value=track_now, key=f"track_{thread_id}", disabled=read_only, help="Track on/off")
-                        if track_new != track_now and not read_only:
-                            mutate_threads(
-                                lambda doc: [
-                                    t.update({"status": "active" if track_new else "paused"})
-                                    for t in doc.get("threads", [])
-                                    if t.get("id") == thread_id
-                                ],
-                                "Toggle thread tracking",
-                            )
-                        if top_controls[3].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
-                            execute_update(
-                                github,
-                                config,
-                                threads_payload,
-                                runtime,
-                                selected_thread_ids={thread_id},
-                                reason=f"refresh_thread_{thread_id}",
-                            )
-                            st.session_state["threads_override"] = threads_payload.get("threads", [])
-                            st.rerun()
-                        if top_controls[4].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
-                            payload, sha = load_sample_payload(github, thread)
-                            payload["samples"] = []
-                            github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
-                            st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
-                            st.rerun()
-                        if top_controls[5].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
-                            mutate_threads(
-                                lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
-                                "Remove thread",
-                            )
-
-                        include_now = bool(thread.get("include_in_adhoc", True))
-                        include_new = st.toggle(
-                            "◎",
-                            value=include_now,
-                            key=f"adhoc_{thread_id}",
-                            disabled=read_only,
-                            help="Include in selected ad hoc refresh",
+                with st.container():
+                    controls = st.columns([1, 1, 1])
+                    if controls[0].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
+                        execute_update(
+                            github,
+                            config,
+                            threads_payload,
+                            runtime,
+                            selected_thread_ids={thread_id},
+                            reason=f"refresh_thread_{thread_id}",
                         )
-                        st.caption("⏻ = track, ◎ = include in selected refresh")
-                        if include_new != include_now and not read_only:
-                            mutate_threads(
-                                lambda doc: [
-                                    t.update({"include_in_adhoc": bool(include_new)})
-                                    for t in doc.get("threads", [])
-                                    if t.get("id") == thread_id
-                                ],
-                                "Toggle ad hoc inclusion",
-                            )
+                        st.session_state["threads_override"] = threads_payload.get("threads", [])
+                        st.rerun()
+                    if controls[1].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
+                        payload, sha = load_sample_payload(github, thread)
+                        payload["samples"] = []
+                        github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
+                        st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
+                        st.rerun()
+                    if controls[2].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
+                        mutate_threads(
+                            lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
+                            "Remove thread",
+                        )
 
                     if not chart_opts["graph_only"]:
                         st.write(
                             f"**Current title:** <span style='color:{current_color};'>{current_title}</span>",
                             unsafe_allow_html=True,
                         )
+                        st.caption(f"{display_name} ({status})")
                         st.caption(subforum_name_map.get(thread.get("subforum_key"), thread.get("subforum_key", "Unknown")))
                         st.write(f"Last views: `{thread.get('last_view_count', 'N/A')}`")
                         if thread.get("last_found_page") is not None:
@@ -1125,12 +1225,8 @@ def main() -> None:
                     df = df.sort_values("ts").reset_index(drop=True)
                     initial_upper = df["ts"].iloc[-1]
                     initial_lower = df["ts"].iloc[0]
-                    range_expanded = not chart_opts["graph_only"]
-                    show_x_range = st.toggle(
-                        "Show X range controls",
-                        value=range_expanded,
-                        key=f"show_x_range_{thread_id}",
-                    )
+                    layout_row = layout_by_id.get(str(thread_id), {"show_x_range": False})
+                    show_x_range = bool(layout_row.get("show_x_range", False))
                     if show_x_range:
                         range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
                         upper_mode = range_cols[0].selectbox(
@@ -1265,22 +1361,28 @@ def main() -> None:
                         fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
                     st.plotly_chart(fig, use_container_width=True)
 
-            if chart_opts["graph_only"]:
-                requested = max(1, int(chart_opts.get("cards_per_row", 3)))
-                per_row = (
-                    effective_cards_per_row(requested)
-                    if bool(chart_opts.get("auto_fit_mobile", True))
-                    else requested
-                )
-                for start in range(0, len(threads), per_row):
-                    row_items = threads[start : start + per_row]
-                    cols = st.columns(per_row)
-                    for offset, thread in enumerate(row_items):
-                        with cols[offset]:
-                            render_thread(start + offset, thread)
+            threads_by_id = {str(t["id"]): t for t in threads}
+            visible_rows = [row for row in layout_applied_rows if row.get("show_card", True) and str(row.get("thread_id")) in threads_by_id]
+            visible_threads = [threads_by_id[str(row["thread_id"])] for row in visible_rows]
+            if not visible_threads:
+                st.info("No thread cards selected in Layout.")
             else:
-                for idx, thread in enumerate(threads):
-                    render_thread(idx, thread)
+                if chart_opts["graph_only"]:
+                    requested = max(1, int(chart_opts.get("cards_per_row", 3)))
+                    per_row = (
+                        effective_cards_per_row(requested)
+                        if bool(chart_opts.get("auto_fit_mobile", True))
+                        else requested
+                    )
+                    for start in range(0, len(visible_threads), per_row):
+                        row_items = visible_threads[start : start + per_row]
+                        cols = st.columns(per_row)
+                        for offset, thread in enumerate(row_items):
+                            with cols[offset]:
+                                render_thread(thread)
+                else:
+                    for thread in visible_threads:
+                        render_thread(thread)
 
     with main_tabs[1]:
         history_df, color_lookup = build_history_table(source, sorted_threads(threads_payload))
