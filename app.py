@@ -1011,28 +1011,43 @@ def main() -> None:
 
                     default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
                     default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
-                    manual_upper_raw = range_cols[3].datetime_input(
-                        "Upper",
-                        value=default_upper_dt,
-                        key=f"x_upper_manual_{thread_id}",
+                    manual_upper_date = range_cols[3].date_input(
+                        "Upper D",
+                        value=default_upper_dt.date(),
+                        key=f"x_upper_date_{thread_id}",
                         disabled=upper_mode != "Manual",
                     )
-                    manual_lower_raw = range_cols[4].datetime_input(
-                        "Lower",
-                        value=default_lower_dt,
-                        key=f"x_lower_manual_{thread_id}",
+                    manual_upper_time = range_cols[3].time_input(
+                        "Upper T",
+                        value=default_upper_dt.time(),
+                        key=f"x_upper_time_{thread_id}",
+                        disabled=upper_mode != "Manual",
+                    )
+                    manual_lower_date = range_cols[4].date_input(
+                        "Lower D",
+                        value=default_lower_dt.date(),
+                        key=f"x_lower_date_{thread_id}",
+                        disabled=lower_mode != "Manual",
+                    )
+                    manual_lower_time = range_cols[4].time_input(
+                        "Lower T",
+                        value=default_lower_dt.time(),
+                        key=f"x_lower_time_{thread_id}",
                         disabled=lower_mode != "Manual",
                     )
                     if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
-                        st.session_state[f"x_upper_mode_{thread_id}"] = "Manual"
-                        st.session_state[f"x_lower_mode_{thread_id}"] = "Manual"
-                        st.session_state[f"x_upper_manual_{thread_id}"] = default_upper_dt
-                        st.session_state[f"x_lower_manual_{thread_id}"] = default_lower_dt
+                        st.session_state[f"x_upper_mode_{thread_id}"] = "Latest"
+                        st.session_state[f"x_lower_mode_{thread_id}"] = "Window"
+                        st.session_state[f"x_window_points_{thread_id}"] = 25
+                        st.session_state[f"x_upper_date_{thread_id}"] = default_upper_dt.date()
+                        st.session_state[f"x_upper_time_{thread_id}"] = default_upper_dt.time()
+                        st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
+                        st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
                         st.rerun()
 
                     upper_ts = initial_upper
                     if upper_mode == "Manual":
-                        upper_ts = pd.Timestamp(manual_upper_raw)
+                        upper_ts = pd.Timestamp(datetime.combine(manual_upper_date, manual_upper_time))
                         if upper_ts.tzinfo is None:
                             upper_ts = upper_ts.tz_localize(NY_TZ)
                         else:
@@ -1048,7 +1063,7 @@ def main() -> None:
                         idx_lower = max(0, idx_upper - window_points)
                         lower_ts = df_u.iloc[idx_lower]["ts"]
                     else:
-                        lower_ts = pd.Timestamp(manual_lower_raw)
+                        lower_ts = pd.Timestamp(datetime.combine(manual_lower_date, manual_lower_time))
                         if lower_ts.tzinfo is None:
                             lower_ts = lower_ts.tz_localize(NY_TZ)
                         else:
