@@ -342,6 +342,22 @@ def load_samples(source: DataSource, thread_id: str) -> dict[str, Any]:
     return fetch_or_default(source, f"data/samples/{thread_id}.json", {"thread_id": thread_id, "samples": []})
 
 
+def effective_cards_per_row(requested: int) -> int:
+    # Best-effort user-agent detection to prevent crowded multi-column graphs on phones.
+    try:
+        headers = st.context.headers  # type: ignore[attr-defined]
+        user_agent = headers.get("User-Agent", "") if headers else ""
+    except Exception:  # noqa: BLE001
+        user_agent = ""
+
+    ua = user_agent.lower()
+    if "mobile" in ua and "ipad" not in ua and "tablet" not in ua:
+        return min(requested, 1)
+    if "ipad" in ua or "tablet" in ua:
+        return min(requested, 2)
+    return requested
+
+
 def abbreviate_label(label: str, width: int = 12) -> str:
     text = " ".join(str(label).split()).strip()
     if len(text) <= width:
@@ -505,6 +521,10 @@ def main() -> None:
         st.exception(exc)
         st.stop()
 
+    # Keep immediate local consistency after writes to avoid perceived no-op ordering changes.
+    if "threads_override" in st.session_state:
+        threads_payload["threads"] = st.session_state["threads_override"]
+
     tracker_cfg = config.setdefault("tracker", {})
     tracker_cfg.setdefault("state", "stopped")
     tracker_cfg.setdefault("interval_minutes", 30)
@@ -532,6 +552,7 @@ def main() -> None:
         marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
         graph_only = st.toggle("Graph-only thread cards", value=False, key="disp_graph_only")
         cards_per_row = 3
+        auto_fit_mobile = True
         if graph_only:
             cards_per_row = int(
                 st.number_input(
@@ -542,6 +563,11 @@ def main() -> None:
                     step=1,
                     key="disp_cards_per_row",
                 )
+            )
+            auto_fit_mobile = st.toggle(
+                "Auto-fit cards per row on mobile",
+                value=True,
+                key="disp_auto_fit_mobile",
             )
         expanded_default = st.toggle("Expand thread cards by default", value=True, key="disp_expand_cards")
         auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
@@ -560,6 +586,7 @@ def main() -> None:
             "y_max": y_max,
             "graph_only": graph_only,
             "cards_per_row": cards_per_row,
+            "auto_fit_mobile": auto_fit_mobile,
             "expanded_default": expanded_default,
         }
 
@@ -587,6 +614,7 @@ def main() -> None:
                     selected_thread_ids=None,
                     reason="start_immediate",
                 )
+                st.session_state["threads_override"] = threads_payload.get("threads", [])
             else:
                 runtime["current_action"] = "idle"
                 runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_minutes", 30)))
@@ -679,6 +707,7 @@ def main() -> None:
                 selected_thread_ids=selected_ids,
                 reason="adhoc_selected",
             )
+            st.session_state["threads_override"] = threads_payload.get("threads", [])
             st.rerun()
 
         all_active = [
@@ -698,6 +727,7 @@ def main() -> None:
                 selected_thread_ids=None,
                 reason="adhoc_all_active",
             )
+            st.session_state["threads_override"] = threads_payload.get("threads", [])
             st.rerun()
 
     with side_tabs[1]:
@@ -742,6 +772,7 @@ def main() -> None:
                         )
                         threads_doc["threads"] = threads
                         github.put_file("data/threads.json", threads_doc, "Add tracked thread", sha)
+                        st.session_state["threads_override"] = threads
                         st.rerun()
 
     with side_tabs[2]:
@@ -813,6 +844,7 @@ def main() -> None:
             thread["order"] = i
         threads_doc["threads"] = threads_list
         github.put_file("data/threads.json", threads_doc, message, sha)
+        st.session_state["threads_override"] = threads_list
         st.rerun()
 
     with main_tabs[0]:
@@ -831,18 +863,18 @@ def main() -> None:
 
                 with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
                     top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
-                    if top_controls[0].button("Up", key=f"move_up_{thread_id}", disabled=read_only or idx == 0):
+                    if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
                         mutate_threads(
                             lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
                             "Move thread up",
                         )
-                    if top_controls[1].button("Down", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1):
+                    if top_controls[1].button("▼", key=f"move_down_{thread_id}", disabled=read_only or idx == len(threads) - 1, help="Move down"):
                         mutate_threads(
                             lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, 1)}),
                             "Move thread down",
                         )
                     track_now = status == "active"
-                    track_new = top_controls[2].toggle("track", value=track_now, key=f"track_{thread_id}", disabled=read_only)
+                    track_new = top_controls[2].toggle("⏻", value=track_now, key=f"track_{thread_id}", disabled=read_only, help="Track on/off")
                     if track_new != track_now and not read_only:
                         mutate_threads(
                             lambda doc: [
@@ -852,7 +884,7 @@ def main() -> None:
                             ],
                             "Toggle thread tracking",
                         )
-                    if top_controls[3].button("Refresh", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id")):
+                    if top_controls[3].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
                         execute_update(
                             github,
                             config,
@@ -861,13 +893,14 @@ def main() -> None:
                             selected_thread_ids={thread_id},
                             reason=f"refresh_thread_{thread_id}",
                         )
+                        st.session_state["threads_override"] = threads_payload.get("threads", [])
                         st.rerun()
-                    if top_controls[4].button("Reset", key=f"reset_{thread_id}", disabled=read_only):
+                    if top_controls[4].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
                         payload, sha = load_sample_payload(github, thread)
                         payload["samples"] = []
                         github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
                         st.rerun()
-                    if top_controls[5].button("Remove", key=f"remove_{thread_id}", disabled=read_only):
+                    if top_controls[5].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
                         mutate_threads(
                             lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
                             "Remove thread",
@@ -875,11 +908,13 @@ def main() -> None:
 
                     include_now = bool(thread.get("include_in_adhoc", True))
                     include_new = st.toggle(
-                        "Include in selected ad hoc refresh",
+                        "◎",
                         value=include_now,
                         key=f"adhoc_{thread_id}",
                         disabled=read_only,
+                        help="Include in selected ad hoc refresh",
                     )
+                    st.caption("⏻ = track, ◎ = include in selected refresh")
                     if include_new != include_now and not read_only:
                         mutate_threads(
                             lambda doc: [
@@ -969,7 +1004,12 @@ def main() -> None:
                     st.plotly_chart(fig, use_container_width=True)
 
             if chart_opts["graph_only"]:
-                per_row = max(1, int(chart_opts.get("cards_per_row", 3)))
+                requested = max(1, int(chart_opts.get("cards_per_row", 3)))
+                per_row = (
+                    effective_cards_per_row(requested)
+                    if bool(chart_opts.get("auto_fit_mobile", True))
+                    else requested
+                )
                 for start in range(0, len(threads), per_row):
                     row_items = threads[start : start + per_row]
                     cols = st.columns(per_row)
