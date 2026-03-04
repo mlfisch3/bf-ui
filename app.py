@@ -290,7 +290,7 @@ def execute_update(
 
     runtime["last_run_finished_at"] = result.finished_at
     runtime["last_run_result"] = "ok" if not result.errors else "warning"
-    runtime["next_run_at"] = next_run_timestamp(int(config.get("tracker", {}).get("interval_minutes", 30)))
+    runtime["next_run_at"] = next_run_timestamp(int(config.get("tracker", {}).get("interval_seconds", 1800)))
 
     state = config.get("tracker", {}).get("state", "stopped")
     runtime["current_action"] = "paused" if state == "paused" else "idle"
@@ -527,7 +527,11 @@ def main() -> None:
 
     tracker_cfg = config.setdefault("tracker", {})
     tracker_cfg.setdefault("state", "stopped")
-    tracker_cfg.setdefault("interval_minutes", 30)
+    if "interval_seconds" not in tracker_cfg:
+        if "interval_minutes" in tracker_cfg:
+            tracker_cfg["interval_seconds"] = int(tracker_cfg.get("interval_minutes", 30)) * 60
+        else:
+            tracker_cfg["interval_seconds"] = 1800
     tracker_cfg.setdefault("start_immediately", True)
 
     defaults_changed = normalize_threads_defaults(threads_payload)
@@ -550,7 +554,7 @@ def main() -> None:
         y_scale = st.selectbox("Y scale", ["linear", "log"], index=0, key="disp_y_scale")
         line_width = st.slider("Line width", min_value=1, max_value=6, value=2, key="disp_line_width")
         marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
-        graph_only = st.toggle("Graph-only thread cards", value=False, key="disp_graph_only")
+        graph_only = st.toggle("Graph-only thread cards", value=True, key="disp_graph_only")
         cards_per_row = 3
         auto_fit_mobile = True
         if graph_only:
@@ -591,7 +595,7 @@ def main() -> None:
         }
 
     with side_tabs[0]:
-        interval = int(tracker_cfg.get("interval_minutes", 30))
+        interval_seconds = int(tracker_cfg.get("interval_seconds", 1800))
         run_immediately = bool(tracker_cfg.get("start_immediately", True))
 
         st.subheader("Run controls")
@@ -617,7 +621,7 @@ def main() -> None:
                 st.session_state["threads_override"] = threads_payload.get("threads", [])
             else:
                 runtime["current_action"] = "idle"
-                runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_minutes", 30)))
+                runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
             put_json(github, "data/config.json", config, "Set tracker state running")
             update_runtime_file(github, runtime, "Tracker running")
             st.rerun()
@@ -633,7 +637,7 @@ def main() -> None:
         if c3.button("Resume", disabled=read_only or state != "paused"):
             tracker_cfg["state"] = "running"
             runtime["current_action"] = "idle"
-            runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_minutes", 30)))
+            runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
             append_event(runtime, "info", "Tracker state changed to running")
             put_json(github, "data/config.json", config, "Set tracker state running")
             update_runtime_file(github, runtime, "Tracker resumed")
@@ -650,15 +654,16 @@ def main() -> None:
 
         st.divider()
         interval_new = st.number_input(
-            "Minutes between updates",
+            "Seconds between updates",
             min_value=5,
-            max_value=240,
-            value=interval,
+            max_value=3600,
+            value=interval_seconds,
             step=5,
             disabled=read_only,
         )
-        if not read_only and interval_new != interval:
-            tracker_cfg["interval_minutes"] = int(interval_new)
+        if not read_only and interval_new != interval_seconds:
+            tracker_cfg["interval_seconds"] = int(interval_new)
+            tracker_cfg["interval_minutes"] = max(1, int(interval_new) // 60)
             put_json(github, "data/config.json", config, "Update tracker interval")
             if tracker_cfg.get("state") == "running":
                 runtime["next_run_at"] = next_run_timestamp(int(interval_new))
@@ -860,9 +865,10 @@ def main() -> None:
                 current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
+                sample_count_preview = len(load_samples(source, thread_id).get("samples", []))
 
                 with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
-                    top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
+                    top_controls = st.columns([1.2, 1, 1, 1, 1, 1, 0.7])
                     if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
                         mutate_threads(
                             lambda doc: doc.update({"threads": move_thread_order(doc.get("threads", []), thread_id, -1)}),
@@ -905,6 +911,7 @@ def main() -> None:
                             lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
                             "Remove thread",
                         )
+                    top_controls[6].markdown(f"### {sample_count_preview}")
 
                     include_now = bool(thread.get("include_in_adhoc", True))
                     include_new = st.toggle(
@@ -972,18 +979,97 @@ def main() -> None:
                         df["title_color"] = "#1f77b4"
                     df["title_color"] = df["title_color"].fillna("#1f77b4")
 
+                    df = df.sort_values("ts").reset_index(drop=True)
+                    initial_upper = df["ts"].iloc[-1]
+                    initial_lower = df["ts"].iloc[0]
+                    range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
+                    upper_mode = range_cols[0].selectbox(
+                        "↑",
+                        options=["Latest", "Manual"],
+                        index=0,
+                        key=f"x_upper_mode_{thread_id}",
+                        help="Upper x bound mode",
+                    )
+                    lower_mode = range_cols[1].selectbox(
+                        "↓",
+                        options=["Window", "Manual"],
+                        index=0,
+                        key=f"x_lower_mode_{thread_id}",
+                        help="Lower x bound mode",
+                    )
+                    window_points = int(
+                        range_cols[2].number_input(
+                            "N",
+                            min_value=1,
+                            max_value=5000,
+                            value=25,
+                            step=1,
+                            key=f"x_window_points_{thread_id}",
+                            help="Past points before current upper point",
+                        )
+                    )
+
+                    default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
+                    default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
+                    manual_upper_raw = range_cols[3].datetime_input(
+                        "Upper",
+                        value=default_upper_dt,
+                        key=f"x_upper_manual_{thread_id}",
+                        disabled=upper_mode != "Manual",
+                    )
+                    manual_lower_raw = range_cols[4].datetime_input(
+                        "Lower",
+                        value=default_lower_dt,
+                        key=f"x_lower_manual_{thread_id}",
+                        disabled=lower_mode != "Manual",
+                    )
+                    if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
+                        st.session_state[f"x_upper_mode_{thread_id}"] = "Manual"
+                        st.session_state[f"x_lower_mode_{thread_id}"] = "Manual"
+                        st.session_state[f"x_upper_manual_{thread_id}"] = default_upper_dt
+                        st.session_state[f"x_lower_manual_{thread_id}"] = default_lower_dt
+                        st.rerun()
+
+                    upper_ts = initial_upper
+                    if upper_mode == "Manual":
+                        upper_ts = pd.Timestamp(manual_upper_raw)
+                        if upper_ts.tzinfo is None:
+                            upper_ts = upper_ts.tz_localize(NY_TZ)
+                        else:
+                            upper_ts = upper_ts.tz_convert(NY_TZ)
+
+                    df_u = df[df["ts"] <= upper_ts].copy()
+                    if df_u.empty:
+                        df_u = df.iloc[[0]].copy()
+                    upper_ts = df_u["ts"].iloc[-1]
+
+                    if lower_mode == "Window":
+                        idx_upper = len(df_u) - 1
+                        idx_lower = max(0, idx_upper - window_points)
+                        lower_ts = df_u.iloc[idx_lower]["ts"]
+                    else:
+                        lower_ts = pd.Timestamp(manual_lower_raw)
+                        if lower_ts.tzinfo is None:
+                            lower_ts = lower_ts.tz_localize(NY_TZ)
+                        else:
+                            lower_ts = lower_ts.tz_convert(NY_TZ)
+
+                    plot_df = df[(df["ts"] >= lower_ts) & (df["ts"] <= upper_ts)].copy()
+                    if plot_df.empty:
+                        plot_df = df.copy()
+
                     fig = go.Figure()
                     fig.add_trace(
                         go.Scatter(
-                            x=df["ts"],
-                            y=df["views"],
+                            x=plot_df["ts"],
+                            y=plot_df["views"],
                             mode=chart_opts["mode"],
                             line={"shape": chart_opts["line_shape"], "width": chart_opts["line_width"], "color": "#444444"},
-                            marker={"size": chart_opts["marker_size"], "color": df["title_color"]},
+                            marker={"size": chart_opts["marker_size"], "color": plot_df["title_color"]},
                             name="Views",
                         )
                     )
-                    dtick_ms = choose_dtick_ms(df["ts"])
+                    dtick_ms = choose_dtick_ms(plot_df["ts"])
                     fig.update_layout(
                         height=640,
                         margin={"l": 10, "r": 10, "t": 45, "b": 10},
@@ -994,6 +1080,7 @@ def main() -> None:
                     xaxis_cfg: dict[str, Any] = {
                         "tickformat": "%H:%M\n%Y-%m-%d",
                         "hoverformat": "%Y-%m-%d %H:%M:%S",
+                        "range": [plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1]],
                     }
                     if dtick_ms is not None:
                         xaxis_cfg["dtick"] = dtick_ms

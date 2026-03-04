@@ -47,8 +47,8 @@ def due_for_run(next_run_at: str | None, now: datetime | None = None) -> bool:
     return now_dt >= next_dt
 
 
-def next_run_timestamp(interval_minutes: int) -> str:
-    dt = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+def next_run_timestamp(interval_seconds: int) -> str:
+    dt = datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
     return dt.isoformat()
 
 
