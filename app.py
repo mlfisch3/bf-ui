@@ -911,7 +911,12 @@ def main() -> None:
 
                 with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
                     controls_expanded = not chart_opts["graph_only"]
-                    with st.expander("Controls", expanded=controls_expanded):
+                    show_controls = st.toggle(
+                        "Show controls",
+                        value=controls_expanded,
+                        key=f"show_controls_{thread_id}",
+                    )
+                    if show_controls:
                         top_controls = st.columns([1.2, 1, 1, 1, 1, 1])
                         if top_controls[0].button("▲", key=f"move_up_{thread_id}", disabled=read_only or idx == 0, help="Move up"):
                             mutate_threads(
@@ -1010,7 +1015,12 @@ def main() -> None:
                     initial_upper = df["ts"].iloc[-1]
                     initial_lower = df["ts"].iloc[0]
                     range_expanded = not chart_opts["graph_only"]
-                    with st.expander("X Range", expanded=range_expanded):
+                    show_x_range = st.toggle(
+                        "Show X range controls",
+                        value=range_expanded,
+                        key=f"show_x_range_{thread_id}",
+                    )
+                    if show_x_range:
                         range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
                         upper_mode = range_cols[0].selectbox(
                             "↑",
@@ -1073,6 +1083,16 @@ def main() -> None:
                             st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
                             st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
                             st.rerun()
+                    else:
+                        upper_mode = "Latest"
+                        lower_mode = "Window"
+                        window_points = 25
+                        default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
+                        default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
+                        manual_upper_date = default_upper_dt.date()
+                        manual_upper_time = default_upper_dt.time()
+                        manual_lower_date = default_lower_dt.date()
+                        manual_lower_time = default_lower_dt.time()
 
                     upper_ts = initial_upper
                     if upper_mode == "Manual":
