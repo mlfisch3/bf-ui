@@ -114,6 +114,44 @@ def fetch_or_default(source: DataSource, path: str, default: dict[str, Any]) -> 
         return default
 
 
+def _deepcopy_doc(payload: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(payload))
+
+
+def init_session_docs(source: DataSource, force_reload: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if force_reload or "config_doc" not in st.session_state:
+        st.session_state["config_doc"] = fetch_or_default(
+            source,
+            "data/config.json",
+            {"schema_version": 1, "tracker": {}, "global": {}, "subforums": []},
+        )
+    if force_reload or "threads_doc" not in st.session_state:
+        st.session_state["threads_doc"] = fetch_or_default(source, "data/threads.json", {"schema_version": 1, "threads": []})
+    if force_reload or "runtime_doc" not in st.session_state:
+        st.session_state["runtime_doc"] = load_runtime(source)
+    if force_reload:
+        st.session_state["sample_cache"] = {}
+    return (
+        _deepcopy_doc(st.session_state["config_doc"]),
+        _deepcopy_doc(st.session_state["threads_doc"]),
+        _deepcopy_doc(st.session_state["runtime_doc"]),
+    )
+
+
+def store_session_docs(
+    *,
+    config: dict[str, Any] | None = None,
+    threads_payload: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
+) -> None:
+    if config is not None:
+        st.session_state["config_doc"] = _deepcopy_doc(config)
+    if threads_payload is not None:
+        st.session_state["threads_doc"] = _deepcopy_doc(threads_payload)
+    if runtime is not None:
+        st.session_state["runtime_doc"] = _deepcopy_doc(runtime)
+
+
 def parse_thread_numeric_id(value: str) -> str | None:
     text = value.strip()
     if not text:
@@ -232,6 +270,7 @@ def persist_update_results(
     runtime: dict[str, Any],
 ) -> None:
     persist_threads_doc(github, threads_payload, "Update thread stats")
+    store_session_docs(threads_payload=threads_payload)
     threads_by_id = {t["id"]: t for t in threads_payload.get("threads", [])}
 
     for thread_id, update_payload in sample_updates.items():
@@ -243,9 +282,11 @@ def persist_update_results(
         payload["thread_numeric_id"] = thread.get("thread_numeric_id")
         payload["title"] = thread.get("current_title") or thread.get("display_name")
         github.put_file(f"data/samples/{thread_id}.json", payload, f"Append samples {thread_id}", sha)
+        st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
 
     runtime["last_run_summary"] = summary
     update_runtime_file(github, runtime, "Update runtime after tracker run")
+    store_session_docs(runtime=runtime)
 
 
 def execute_update(
@@ -310,6 +351,7 @@ def execute_update(
         append_event(runtime, "info", "Run finished successfully")
 
     persist_update_results(github, threads_payload, sample_updates, summary, runtime)
+    store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
     return config, threads_payload, runtime, summary
 
 
@@ -339,7 +381,10 @@ def render_status(config: dict[str, Any], runtime: dict[str, Any]) -> None:
 
 
 def load_samples(source: DataSource, thread_id: str) -> dict[str, Any]:
-    return fetch_or_default(source, f"data/samples/{thread_id}.json", {"thread_id": thread_id, "samples": []})
+    cache: dict[str, dict[str, Any]] = st.session_state.setdefault("sample_cache", {})
+    if thread_id not in cache:
+        cache[thread_id] = fetch_or_default(source, f"data/samples/{thread_id}.json", {"thread_id": thread_id, "samples": []})
+    return _deepcopy_doc(cache[thread_id])
 
 
 def effective_cards_per_row(requested: int) -> int:
@@ -506,9 +551,8 @@ def main() -> None:
     st.caption(f"Tracker repo: {repo} ({branch})")
 
     try:
-        config = fetch_or_default(source, "data/config.json", {"schema_version": 1, "tracker": {}, "global": {}, "subforums": []})
-        threads_payload = fetch_or_default(source, "data/threads.json", {"schema_version": 1, "threads": []})
-        runtime = load_runtime(source)
+        force_reload = bool(st.session_state.pop("force_reload_docs", False))
+        config, threads_payload, runtime = init_session_docs(source, force_reload=force_reload)
     except Exception as exc:  # noqa: BLE001
         if github:
             try:
@@ -524,6 +568,7 @@ def main() -> None:
     # Keep immediate local consistency after writes to avoid perceived no-op ordering changes.
     if "threads_override" in st.session_state:
         threads_payload["threads"] = st.session_state["threads_override"]
+        st.session_state["threads_doc"] = _deepcopy_doc(threads_payload)
 
     tracker_cfg = config.setdefault("tracker", {})
     tracker_cfg.setdefault("state", "stopped")
@@ -537,6 +582,7 @@ def main() -> None:
     defaults_changed = normalize_threads_defaults(threads_payload)
     if defaults_changed and github and not read_only:
         persist_threads_doc(github, threads_payload, "Normalize thread defaults")
+        store_session_docs(threads_payload=threads_payload)
 
     state = tracker_cfg.get("state", "stopped")
     if state == "running":
@@ -603,7 +649,7 @@ def main() -> None:
         if not read_only and run_immediately_new != run_immediately:
             tracker_cfg["start_immediately"] = run_immediately_new
             put_json(github, "data/config.json", config, "Update start behavior")
-            st.rerun()
+            store_session_docs(config=config)
 
         c1, c2, c3, c4 = st.columns(4)
         if c1.button("Start", disabled=read_only or state == "running"):
@@ -624,6 +670,7 @@ def main() -> None:
                 runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
             put_json(github, "data/config.json", config, "Set tracker state running")
             update_runtime_file(github, runtime, "Tracker running")
+            store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
             st.rerun()
 
         if c2.button("Pause", disabled=read_only or state != "running"):
@@ -632,6 +679,7 @@ def main() -> None:
             append_event(runtime, "info", "Tracker state changed to paused")
             put_json(github, "data/config.json", config, "Set tracker state paused")
             update_runtime_file(github, runtime, "Tracker paused")
+            store_session_docs(config=config, runtime=runtime)
             st.rerun()
 
         if c3.button("Resume", disabled=read_only or state != "paused"):
@@ -641,6 +689,7 @@ def main() -> None:
             append_event(runtime, "info", "Tracker state changed to running")
             put_json(github, "data/config.json", config, "Set tracker state running")
             update_runtime_file(github, runtime, "Tracker resumed")
+            store_session_docs(config=config, runtime=runtime)
             st.rerun()
 
         if c4.button("Stop", disabled=read_only or state == "stopped"):
@@ -650,6 +699,7 @@ def main() -> None:
             append_event(runtime, "info", "Tracker state changed to stopped")
             put_json(github, "data/config.json", config, "Set tracker state stopped")
             update_runtime_file(github, runtime, "Tracker stopped")
+            store_session_docs(config=config, runtime=runtime)
             st.rerun()
 
         st.divider()
@@ -668,7 +718,7 @@ def main() -> None:
             if tracker_cfg.get("state") == "running":
                 runtime["next_run_at"] = next_run_timestamp(int(interval_new))
                 update_runtime_file(github, runtime, "Reschedule next run")
-            st.rerun()
+            store_session_docs(config=config, runtime=runtime)
 
         max_rate = int(config.get("global", {}).get("max_requests_per_minute", 12))
         max_rate_new = st.number_input(
@@ -682,7 +732,7 @@ def main() -> None:
         if not read_only and max_rate_new != max_rate:
             config.setdefault("global", {})["max_requests_per_minute"] = int(max_rate_new)
             put_json(github, "data/config.json", config, "Update rate limit")
-            st.rerun()
+            store_session_docs(config=config)
 
         global_cfg = config.setdefault("global", {})
         min_delay = float(global_cfg.get("min_delay_seconds", 0.2))
@@ -714,7 +764,7 @@ def main() -> None:
             global_cfg["min_delay_seconds"] = float(min_delay_new)
             global_cfg["max_delay_seconds"] = float(max(max_delay_new, min_delay_new))
             put_json(github, "data/config.json", config, "Update request delay jitter")
-            st.rerun()
+            store_session_docs(config=config)
 
         st.divider()
         st.subheader("Ad hoc update")
@@ -810,6 +860,7 @@ def main() -> None:
                         threads_doc["threads"] = threads
                         github.put_file("data/threads.json", threads_doc, "Add tracked thread", sha)
                         st.session_state["threads_override"] = threads
+                        store_session_docs(threads_payload=threads_doc)
                         st.rerun()
 
         st.divider()
@@ -837,6 +888,7 @@ def main() -> None:
                             break
                     github.put_file("data/threads.json", mutate_doc, "Update thread numeric id", sha)
                     st.session_state["threads_override"] = mutate_doc.get("threads", [])
+                    store_session_docs(threads_payload=mutate_doc)
                     st.rerun()
 
     with side_tabs[2]:
@@ -870,7 +922,7 @@ def main() -> None:
             for idx, row in edited.iterrows():
                 config["subforums"][idx]["max_pages_per_update"] = int(row["Max pages"])
             put_json(github, "data/config.json", config, "Update subforum limits")
-            st.rerun()
+            store_session_docs(config=config)
 
     with side_tabs[4]:
         st.subheader("Thread update counts")
@@ -926,7 +978,7 @@ def main() -> None:
 
     config, threads_payload, runtime, did_run = run_local_update_if_due(github, config, threads_payload, runtime)
     if did_run:
-        st.rerun()
+        store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
 
     main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events"])
 
@@ -939,6 +991,7 @@ def main() -> None:
         threads_doc["threads"] = threads_list
         github.put_file("data/threads.json", threads_doc, message, sha)
         st.session_state["threads_override"] = threads_list
+        store_session_docs(threads_payload=threads_doc)
         st.rerun()
 
     with main_tabs[0]:
@@ -954,8 +1007,19 @@ def main() -> None:
                 current_title = thread.get("current_title") or thread.get("last_seen_title") or "N/A"
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
+                card_expanded_key = f"card_expanded_{thread_id}"
+                if card_expanded_key not in st.session_state:
+                    st.session_state[card_expanded_key] = bool(chart_opts["expanded_default"])
 
-                with st.expander(f"{display_name} ({status})", expanded=bool(chart_opts["expanded_default"])):
+                with st.expander(f"{display_name} ({status})", expanded=bool(st.session_state[card_expanded_key])):
+                    card_expanded = st.toggle(
+                        "Expanded",
+                        value=bool(st.session_state[card_expanded_key]),
+                        key=f"{card_expanded_key}_toggle",
+                    )
+                    st.session_state[card_expanded_key] = bool(card_expanded)
+                    if not card_expanded:
+                        return
                     controls_expanded = not chart_opts["graph_only"]
                     show_controls = st.toggle(
                         "Show controls",
@@ -1000,6 +1064,7 @@ def main() -> None:
                             payload, sha = load_sample_payload(github, thread)
                             payload["samples"] = []
                             github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
+                            st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
                             st.rerun()
                         if top_controls[5].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
                             mutate_threads(
