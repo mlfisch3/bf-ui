@@ -98,7 +98,10 @@ def log_ui_error(github: GithubClient | None, exc: Exception) -> None:
 
 
 def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: str) -> None:
-    current, sha = github.get_file(path)
+    try:
+        current, sha = github.get_file(path)
+    except Exception:  # noqa: BLE001
+        current, sha = None, None
     if current == payload:
         return
     github.put_file(path, payload, message, sha)
