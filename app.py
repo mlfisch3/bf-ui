@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import traceback
+import zipfile
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -122,7 +124,7 @@ def _deepcopy_doc(payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(payload))
 
 
-def init_session_docs(source: DataSource, force_reload: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def init_session_docs(source: DataSource, force_reload: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     if force_reload or "config_doc" not in st.session_state:
         st.session_state["config_doc"] = fetch_or_default(
             source,
@@ -133,12 +135,15 @@ def init_session_docs(source: DataSource, force_reload: bool = False) -> tuple[d
         st.session_state["threads_doc"] = fetch_or_default(source, "data/threads.json", {"schema_version": 1, "threads": []})
     if force_reload or "runtime_doc" not in st.session_state:
         st.session_state["runtime_doc"] = load_runtime(source)
+    if force_reload or "catalog_doc" not in st.session_state:
+        st.session_state["catalog_doc"] = load_catalog(source)
     if force_reload:
         st.session_state["sample_cache"] = {}
     return (
         _deepcopy_doc(st.session_state["config_doc"]),
         _deepcopy_doc(st.session_state["threads_doc"]),
         _deepcopy_doc(st.session_state["runtime_doc"]),
+        _deepcopy_doc(st.session_state["catalog_doc"]),
     )
 
 
@@ -147,6 +152,7 @@ def store_session_docs(
     config: dict[str, Any] | None = None,
     threads_payload: dict[str, Any] | None = None,
     runtime: dict[str, Any] | None = None,
+    catalog: dict[str, Any] | None = None,
 ) -> None:
     if config is not None:
         st.session_state["config_doc"] = _deepcopy_doc(config)
@@ -154,6 +160,8 @@ def store_session_docs(
         st.session_state["threads_doc"] = _deepcopy_doc(threads_payload)
     if runtime is not None:
         st.session_state["runtime_doc"] = _deepcopy_doc(runtime)
+    if catalog is not None:
+        st.session_state["catalog_doc"] = _deepcopy_doc(catalog)
 
 
 def parse_thread_numeric_id(value: str) -> str | None:
@@ -198,6 +206,31 @@ def load_runtime(source: DataSource) -> dict[str, Any]:
     runtime.setdefault("next_run_at", None)
     runtime.setdefault("events", [])
     return runtime
+
+
+def load_catalog(source: DataSource) -> dict[str, Any]:
+    payload = fetch_or_default(source, "data/thread_catalog.json", {"schema_version": 1, "threads": []})
+    payload.setdefault("threads", [])
+    return payload
+
+
+def upsert_catalog_entries(catalog: dict[str, Any], threads: list[dict[str, Any]]) -> dict[str, Any]:
+    by_id = {str(t.get("id")): t for t in catalog.get("threads", []) if t.get("id")}
+    for thread in threads:
+        thread_id = str(thread.get("id"))
+        if not thread_id:
+            continue
+        entry = by_id.get(thread_id, {"id": thread_id, "created_at": utc_now()})
+        entry["display_name"] = thread.get("display_name")
+        entry["thread_numeric_id"] = thread.get("thread_numeric_id")
+        entry["subforum_key"] = thread.get("subforum_key")
+        entry["last_seen_title"] = thread.get("last_seen_title")
+        entry["current_title"] = thread.get("current_title")
+        entry["status"] = thread.get("status", "paused")
+        entry["include_in_adhoc"] = bool(thread.get("include_in_adhoc", False))
+        by_id[thread_id] = entry
+    catalog["threads"] = sorted(by_id.values(), key=lambda x: (x.get("created_at", ""), x.get("id", "")))
+    return catalog
 
 
 def append_event(runtime: dict[str, Any], level: str, message: str) -> None:
@@ -367,21 +400,24 @@ def render_status(config: dict[str, Any], runtime: dict[str, Any]) -> None:
     elif state == "paused" and "(paused)" not in action:
         action = f"{action} (paused)"
 
-    cols = st.columns([1.2, 1, 1, 1])
-    with cols[0]:
-        if state == "running":
-            st.success("State: Running")
-        elif state == "paused":
-            st.warning("State: Paused")
-        else:
-            st.info("State: Stopped")
-    with cols[1]:
-        st.metric("Current action", action)
-    with cols[2]:
-        st.metric("Last run", to_ny_24h(runtime.get("last_run_finished_at")))
-    with cols[3]:
-        next_run = runtime.get("next_run_at") if state == "running" else None
-        st.metric("Next run", to_ny_24h(next_run))
+    st.markdown(
+        """
+<style>
+.status-line{font-size:0.78rem;line-height:1.2rem;margin:0.15rem 0;}
+.status-k{font-weight:600;}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    state_text = "Running" if state == "running" else ("Paused" if state == "paused" else "Stopped")
+    next_run = runtime.get("next_run_at") if state == "running" else None
+    st.markdown(f"<div class='status-line'><span class='status-k'>State:</span> {state_text}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='status-line'><span class='status-k'>Current action:</span> {action}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='status-line'><span class='status-k'>Last run:</span> {to_ny_24h(runtime.get('last_run_finished_at'))}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"<div class='status-line'><span class='status-k'>Next run:</span> {to_ny_24h(next_run)}</div>", unsafe_allow_html=True)
 
 
 def load_samples(source: DataSource, thread_id: str) -> dict[str, Any]:
@@ -500,7 +536,12 @@ def sorted_threads(threads_payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def thread_label(thread: dict[str, Any]) -> str:
-    return str(thread.get("display_name") or thread.get("current_title") or thread.get("id"))
+    label = str(thread.get("display_name") or thread.get("current_title") or thread.get("id"))
+    if not thread.get("thread_numeric_id") and "-" in label:
+        parts = label.split("-")
+        if len(parts) > 1:
+            label = "-".join(parts[:-1]).strip()
+    return label
 
 
 def sync_layout_rows(threads: list[dict[str, Any]], rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -537,20 +578,6 @@ def sync_tracker_rows(threads: list[dict[str, Any]], rows: list[dict[str, Any]] 
 
 def rows_dirty(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
     return json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True)
-
-
-def move_thread_order(threads: list[dict[str, Any]], thread_id: str, delta: int) -> list[dict[str, Any]]:
-    ordered = sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
-    idx = next((i for i, t in enumerate(ordered) if t.get("id") == thread_id), None)
-    if idx is None:
-        return ordered
-    new_idx = idx + delta
-    if new_idx < 0 or new_idx >= len(ordered):
-        return ordered
-    ordered[idx], ordered[new_idx] = ordered[new_idx], ordered[idx]
-    for i, thread in enumerate(ordered):
-        thread["order"] = i
-    return ordered
 
 
 def run_local_update_if_due(
@@ -593,7 +620,7 @@ def main() -> None:
 
     try:
         force_reload = bool(st.session_state.pop("force_reload_docs", False))
-        config, threads_payload, runtime = init_session_docs(source, force_reload=force_reload)
+        config, threads_payload, runtime, catalog = init_session_docs(source, force_reload=force_reload)
     except Exception as exc:  # noqa: BLE001
         if github:
             try:
@@ -610,9 +637,13 @@ def main() -> None:
     if "threads_override" in st.session_state:
         threads_payload["threads"] = st.session_state["threads_override"]
         st.session_state["threads_doc"] = _deepcopy_doc(threads_payload)
+        catalog = upsert_catalog_entries(catalog, threads_payload.get("threads", []))
+        store_session_docs(catalog=catalog)
 
     tracker_cfg = config.setdefault("tracker", {})
-    tracker_cfg.setdefault("state", "stopped")
+    tracker_cfg.setdefault("state", "paused")
+    if tracker_cfg.get("state") == "stopped":
+        tracker_cfg["state"] = "paused"
     if "interval_seconds" not in tracker_cfg:
         if "interval_minutes" in tracker_cfg:
             tracker_cfg["interval_seconds"] = int(tracker_cfg.get("interval_minutes", 30)) * 60
@@ -624,6 +655,8 @@ def main() -> None:
     if defaults_changed and github and not read_only:
         persist_threads_doc(github, threads_payload, "Normalize thread defaults")
         store_session_docs(threads_payload=threads_payload)
+    catalog = upsert_catalog_entries(catalog, threads_payload.get("threads", []))
+    store_session_docs(catalog=catalog)
 
     state = tracker_cfg.get("state", "stopped")
     if state == "running":
@@ -690,6 +723,32 @@ def main() -> None:
         st.divider()
         interval_seconds = int(tracker_cfg.get("interval_seconds", 1800))
         run_immediately = bool(tracker_cfg.get("start_immediately", True))
+        current_running = tracker_cfg.get("state", "paused") == "running"
+        desired_running = st.toggle("Tracker running", value=current_running, key="tracker_running_desired")
+        if desired_running != current_running:
+            if st.button("Apply tracker state", disabled=read_only):
+                tracker_cfg["state"] = "running" if desired_running else "paused"
+                if desired_running:
+                    append_event(runtime, "info", "Tracker state changed to running")
+                    runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
+                    if tracker_cfg.get("start_immediately", True):
+                        config, threads_payload, runtime, _ = execute_update(
+                            github,
+                            config,
+                            threads_payload,
+                            runtime,
+                            selected_thread_ids=None,
+                            reason="toggle_running_immediate",
+                        )
+                        st.session_state["threads_override"] = threads_payload.get("threads", [])
+                else:
+                    runtime["current_action"] = "paused"
+                    runtime["next_run_at"] = None
+                    append_event(runtime, "info", "Tracker state changed to paused")
+                put_json(github, "data/config.json", config, "Apply tracker state")
+                update_runtime_file(github, runtime, "Tracker state updated")
+                store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
+                st.rerun()
 
         st.subheader("Run controls")
         run_immediately_new = st.checkbox("Run immediately on start", value=run_immediately, disabled=read_only)
@@ -697,57 +756,6 @@ def main() -> None:
             tracker_cfg["start_immediately"] = run_immediately_new
             put_json(github, "data/config.json", config, "Update start behavior")
             store_session_docs(config=config)
-
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("Start", disabled=read_only or state == "running"):
-            tracker_cfg["state"] = "running"
-            append_event(runtime, "info", "Tracker state changed to running")
-            if tracker_cfg.get("start_immediately", True):
-                config, threads_payload, runtime, _ = execute_update(
-                    github,
-                    config,
-                    threads_payload,
-                    runtime,
-                    selected_thread_ids=None,
-                    reason="start_immediate",
-                )
-                st.session_state["threads_override"] = threads_payload.get("threads", [])
-            else:
-                runtime["current_action"] = "idle"
-                runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
-            put_json(github, "data/config.json", config, "Set tracker state running")
-            update_runtime_file(github, runtime, "Tracker running")
-            store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
-            st.rerun()
-
-        if c2.button("Pause", disabled=read_only or state != "running"):
-            tracker_cfg["state"] = "paused"
-            runtime["current_action"] = "paused"
-            append_event(runtime, "info", "Tracker state changed to paused")
-            put_json(github, "data/config.json", config, "Set tracker state paused")
-            update_runtime_file(github, runtime, "Tracker paused")
-            store_session_docs(config=config, runtime=runtime)
-            st.rerun()
-
-        if c3.button("Resume", disabled=read_only or state != "paused"):
-            tracker_cfg["state"] = "running"
-            runtime["current_action"] = "idle"
-            runtime["next_run_at"] = next_run_timestamp(int(tracker_cfg.get("interval_seconds", 1800)))
-            append_event(runtime, "info", "Tracker state changed to running")
-            put_json(github, "data/config.json", config, "Set tracker state running")
-            update_runtime_file(github, runtime, "Tracker resumed")
-            store_session_docs(config=config, runtime=runtime)
-            st.rerun()
-
-        if c4.button("Stop", disabled=read_only or state == "stopped"):
-            tracker_cfg["state"] = "stopped"
-            runtime["current_action"] = "idle"
-            runtime["next_run_at"] = None
-            append_event(runtime, "info", "Tracker state changed to stopped")
-            put_json(github, "data/config.json", config, "Set tracker state stopped")
-            update_runtime_file(github, runtime, "Tracker stopped")
-            store_session_docs(config=config, runtime=runtime)
-            st.rerun()
 
         st.divider()
         interval_new = st.number_input(
@@ -906,6 +914,9 @@ def main() -> None:
                         )
                         threads_doc["threads"] = threads
                         github.put_file("data/threads.json", threads_doc, "Add tracked thread", sha)
+                        catalog = upsert_catalog_entries(catalog, threads_doc.get("threads", []))
+                        put_json(github, "data/thread_catalog.json", catalog, "Update thread catalog")
+                        store_session_docs(catalog=catalog)
                         st.session_state["threads_override"] = threads
                         pending_ids = set(st.session_state.get("pending_registration_ids", []))
                         pending_ids.add(new_id)
@@ -937,6 +948,9 @@ def main() -> None:
                             thread["thread_numeric_id"] = str(numeric)
                             break
                     github.put_file("data/threads.json", mutate_doc, "Update thread numeric id", sha)
+                    catalog = upsert_catalog_entries(catalog, mutate_doc.get("threads", []))
+                    put_json(github, "data/thread_catalog.json", catalog, "Update thread catalog")
+                    store_session_docs(catalog=catalog)
                     st.session_state["threads_override"] = mutate_doc.get("threads", [])
                     store_session_docs(threads_payload=mutate_doc)
                     st.rerun()
@@ -951,7 +965,17 @@ def main() -> None:
 
         draft_ids = [row["thread_id"] for row in tracker_draft]
         if sort_items and draft_ids:
-            label_to_id = {f"{thread_label(thread_map[item_id])} [{item_id[:7]}]": item_id for item_id in draft_ids if item_id in thread_map}
+            label_to_id: dict[str, str] = {}
+            for item_id in draft_ids:
+                if item_id not in thread_map:
+                    continue
+                base = thread_label(thread_map[item_id])
+                label = base
+                n = 2
+                while label in label_to_id:
+                    label = f"{base} ({n})"
+                    n += 1
+                label_to_id[label] = item_id
             sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="threads_sort_panel")
             ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
             ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
@@ -999,6 +1023,9 @@ def main() -> None:
                     ordered_threads.append(tail)
                 threads_doc["threads"] = ordered_threads
                 github.put_file("data/threads.json", threads_doc, "Apply thread panel settings", sha)
+                catalog = upsert_catalog_entries(catalog, threads_doc.get("threads", []))
+                put_json(github, "data/thread_catalog.json", catalog, "Update thread catalog")
+                store_session_docs(catalog=catalog)
                 st.session_state["threads_override"] = ordered_threads
                 st.session_state["tracker_applied"] = _deepcopy_doc(updated_tracker_rows)
                 active_pending = {x["thread_id"] for x in updated_tracker_rows if x["thread_id"] in pending_registration_ids and x.get("track")}
@@ -1006,6 +1033,82 @@ def main() -> None:
                 st.session_state["pending_registration_ids"] = sorted(pending_registration_ids)
                 store_session_docs(threads_payload=threads_doc)
                 st.rerun()
+
+        st.divider()
+        st.subheader("Restore Previously Tracked")
+        active_ids = {str(t.get("id")) for t in threads_payload.get("threads", [])}
+        archived_entries = [t for t in catalog.get("threads", []) if str(t.get("id")) not in active_ids]
+        if not archived_entries:
+            st.caption("No archived threads available")
+        else:
+            restore_labels = {
+                f"{thread_label(item)} ({item.get('thread_numeric_id') or 'no id'})": str(item.get("id"))
+                for item in archived_entries
+            }
+            restore_picks = st.multiselect("Archived threads", options=list(restore_labels.keys()), key="restore_threads_pick")
+            if restore_picks and st.button("Restore selected threads", disabled=read_only):
+                threads_doc, sha = github.get_file("data/threads.json")
+                existing_ids = {str(t.get("id")) for t in threads_doc.get("threads", [])}
+                order_start = len(threads_doc.get("threads", []))
+                appended = 0
+                for pick in restore_picks:
+                    thread_id = restore_labels[pick]
+                    if thread_id in existing_ids:
+                        continue
+                    entry = next((x for x in archived_entries if str(x.get("id")) == thread_id), None)
+                    if not entry:
+                        continue
+                    threads_doc.setdefault("threads", []).append(
+                        {
+                            "id": thread_id,
+                            "display_name": entry.get("display_name") or f"Thread {entry.get('thread_numeric_id') or thread_id}",
+                            "thread_numeric_id": entry.get("thread_numeric_id"),
+                            "subforum_key": entry.get("subforum_key"),
+                            "status": "paused",
+                            "include_in_adhoc": False,
+                            "order": order_start + appended,
+                            "created_at": entry.get("created_at") or utc_now(),
+                            "title_history": [],
+                            "title_color_map": {},
+                            "last_seen_title": entry.get("last_seen_title"),
+                            "current_title": entry.get("current_title"),
+                        }
+                    )
+                    appended += 1
+                github.put_file("data/threads.json", threads_doc, "Restore archived threads", sha)
+                catalog = upsert_catalog_entries(catalog, threads_doc.get("threads", []))
+                put_json(github, "data/thread_catalog.json", catalog, "Update thread catalog")
+                store_session_docs(catalog=catalog, threads_payload=threads_doc)
+                st.session_state["threads_override"] = threads_doc.get("threads", [])
+                st.rerun()
+
+        st.divider()
+        if st.button("Save data and remove all threads", disabled=read_only or not threads_payload.get("threads")):
+            snapshot_name = f"snapshot_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}.json"
+            snapshot_payload = {
+                "ts": utc_now(),
+                "config": config,
+                "runtime": runtime,
+                "threads": threads_payload.get("threads", []),
+                "catalog": catalog,
+            }
+            put_json(github, f"data/snapshots/{snapshot_name}", snapshot_payload, "Write tracker snapshot")
+            threads_doc, sha = github.get_file("data/threads.json")
+            for entry in catalog.get("threads", []):
+                if str(entry.get("id")) in {str(t.get("id")) for t in threads_doc.get("threads", [])}:
+                    entry["status"] = "paused"
+                    entry["include_in_adhoc"] = False
+                    entry["archived_at"] = utc_now()
+            threads_doc["threads"] = []
+            github.put_file("data/threads.json", threads_doc, "Remove all tracker threads", sha)
+            put_json(github, "data/thread_catalog.json", catalog, "Archive all threads in catalog")
+            st.session_state["threads_override"] = []
+            st.session_state["layout_applied"] = []
+            st.session_state["layout_draft"] = []
+            st.session_state["tracker_applied"] = []
+            st.session_state["tracker_draft"] = []
+            store_session_docs(threads_payload=threads_doc, catalog=catalog)
+            st.rerun()
 
     with side_tabs[2]:
         st.subheader("Thread Cards Layout")
@@ -1018,7 +1121,17 @@ def main() -> None:
 
         draft_ids = [row["thread_id"] for row in layout_draft]
         if sort_items and draft_ids:
-            label_to_id = {f"{thread_label(thread_map[item_id])} [{item_id[:7]}]": item_id for item_id in draft_ids if item_id in thread_map}
+            label_to_id: dict[str, str] = {}
+            for item_id in draft_ids:
+                if item_id not in thread_map:
+                    continue
+                base = thread_label(thread_map[item_id])
+                label = base
+                n = 2
+                while label in label_to_id:
+                    label = f"{base} ({n})"
+                    n += 1
+                label_to_id[label] = item_id
             sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="layout_sort_panel")
             ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
             ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
@@ -1054,7 +1167,7 @@ def main() -> None:
             "Set max pages for all subforums",
             min_value=1,
             max_value=200,
-            value=3,
+            value=10,
             step=1,
             disabled=read_only,
             help="Higher values search deeper pages but increase request load and runtime.",
@@ -1131,6 +1244,38 @@ def main() -> None:
         csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8") if csv_rows else b""
         st.download_button("Download CSV", data=csv_bytes, file_name="bladeforums_views.csv", mime="text/csv")
 
+        st.divider()
+        st.subheader("Full Data Archive")
+        if st.button("Build archive ZIP"):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("data/config.json", json.dumps(config, indent=2))
+                zf.writestr("data/runtime.json", json.dumps(runtime, indent=2))
+                zf.writestr("data/threads.json", json.dumps(threads_payload, indent=2))
+                zf.writestr("data/thread_catalog.json", json.dumps(catalog, indent=2))
+                thread_ids = {str(t.get("id")) for t in threads_payload.get("threads", []) if t.get("id")}
+                thread_ids.update({str(t.get("id")) for t in catalog.get("threads", []) if t.get("id")})
+                for thread_id in sorted(thread_ids):
+                    try:
+                        sample_doc = fetch_or_default(source, f"data/samples/{thread_id}.json", {"thread_id": thread_id, "samples": []})
+                        zf.writestr(f"data/samples/{thread_id}.json", json.dumps(sample_doc, indent=2))
+                    except Exception:  # noqa: BLE001
+                        continue
+                ui_errors = fetch_or_default(source, "data/ui_errors.json", {"errors": []})
+                zf.writestr("data/ui_errors.json", json.dumps(ui_errors, indent=2))
+            st.session_state["archive_zip_bytes"] = buf.getvalue()
+
+        if st.session_state.get("archive_zip_bytes"):
+            downloaded = st.download_button(
+                "Download full archive ZIP",
+                data=st.session_state["archive_zip_bytes"],
+                file_name=f"bf_tracker_archive_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                key="download_full_archive_zip",
+            )
+            if downloaded:
+                st.session_state["archive_zip_bytes"] = b""
+
     config, threads_payload, runtime, did_run = run_local_update_if_due(github, config, threads_payload, runtime)
     if did_run:
         store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
@@ -1145,6 +1290,10 @@ def main() -> None:
             thread["order"] = i
         threads_doc["threads"] = threads_list
         github.put_file("data/threads.json", threads_doc, message, sha)
+        current_catalog = load_catalog(source)
+        current_catalog = upsert_catalog_entries(current_catalog, threads_list)
+        put_json(github, "data/thread_catalog.json", current_catalog, "Sync thread catalog")
+        store_session_docs(catalog=current_catalog)
         st.session_state["threads_override"] = threads_list
         store_session_docs(threads_payload=threads_doc)
         st.rerun()
