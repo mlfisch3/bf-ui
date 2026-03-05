@@ -55,6 +55,20 @@ st.markdown(
   text-align: left;
   white-space: nowrap;
 }
+.panel-row-label {
+  font-size: 0.78rem;
+  line-height: 1rem;
+  margin-top: 0.2rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.panel-head {
+  font-size: 0.7rem;
+  color: #666;
+  font-weight: 600;
+  margin-top: 0.15rem;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -987,14 +1001,30 @@ def main() -> None:
         updated_tracker_rows: list[dict[str, Any]] = []
         panel = st.container(border=True)
         with panel:
+            head = st.columns([0.6, 0.6, 4.8])
+            head[0].markdown("<div class='panel-head'>T</div>", unsafe_allow_html=True)
+            head[1].markdown("<div class='panel-head'>A</div>", unsafe_allow_html=True)
+            head[2].markdown("<div class='panel-head'>Thread</div>", unsafe_allow_html=True)
             for thread_id in ordered_ids:
                 row = next((x for x in tracker_draft if x["thread_id"] == thread_id), None)
                 if not row or thread_id not in thread_map:
                     continue
-                cols = st.columns([0.8, 0.8, 3.8])
-                track_val = cols[0].toggle("T", value=bool(row.get("track", False)), key=f"tracker_track_{thread_id}", help="Track")
-                adhoc_val = cols[1].toggle("A", value=bool(row.get("adhoc", True)), key=f"tracker_adhoc_{thread_id}", help="Include in ad hoc")
-                cols[2].caption(thread_label(thread_map[thread_id]))
+                cols = st.columns([0.6, 0.6, 4.8])
+                track_val = cols[0].toggle(
+                    "Track",
+                    value=bool(row.get("track", False)),
+                    key=f"tracker_track_{thread_id}",
+                    help="Track",
+                    label_visibility="collapsed",
+                )
+                adhoc_val = cols[1].toggle(
+                    "Adhoc",
+                    value=bool(row.get("adhoc", True)),
+                    key=f"tracker_adhoc_{thread_id}",
+                    help="Include in ad hoc refresh",
+                    label_visibility="collapsed",
+                )
+                cols[2].markdown(f"<div class='panel-row-label'>{thread_label(thread_map[thread_id])}</div>", unsafe_allow_html=True)
                 updated_tracker_rows.append({"thread_id": thread_id, "track": bool(track_val), "adhoc": bool(adhoc_val)})
 
         st.session_state["tracker_draft"] = updated_tracker_rows
@@ -1143,14 +1173,30 @@ def main() -> None:
         updated_layout_rows: list[dict[str, Any]] = []
         panel = st.container(border=True)
         with panel:
+            head = st.columns([0.6, 0.6, 4.8])
+            head[0].markdown("<div class='panel-head'>C</div>", unsafe_allow_html=True)
+            head[1].markdown("<div class='panel-head'>X</div>", unsafe_allow_html=True)
+            head[2].markdown("<div class='panel-head'>Thread</div>", unsafe_allow_html=True)
             for thread_id in ordered_ids:
                 row = next((x for x in layout_draft if x["thread_id"] == thread_id), None)
                 if not row or thread_id not in thread_map:
                     continue
-                cols = st.columns([0.8, 0.8, 3.8])
-                show_card = cols[0].toggle("C", value=bool(row.get("show_card", True)), key=f"layout_show_{thread_id}", help="Show card")
-                show_x = cols[1].toggle("X", value=bool(row.get("show_x_range", False)), key=f"layout_x_{thread_id}", help="Show X range controls")
-                cols[2].caption(thread_label(thread_map[thread_id]))
+                cols = st.columns([0.6, 0.6, 4.8])
+                show_card = cols[0].toggle(
+                    "Card",
+                    value=bool(row.get("show_card", True)),
+                    key=f"layout_show_{thread_id}",
+                    help="Show card",
+                    label_visibility="collapsed",
+                )
+                show_x = cols[1].toggle(
+                    "X range",
+                    value=bool(row.get("show_x_range", False)),
+                    key=f"layout_x_{thread_id}",
+                    help="Show X range controls",
+                    label_visibility="collapsed",
+                )
+                cols[2].markdown(f"<div class='panel-row-label'>{thread_label(thread_map[thread_id])}</div>", unsafe_allow_html=True)
                 updated_layout_rows.append({"thread_id": thread_id, "show_card": bool(show_card), "show_x_range": bool(show_x)})
 
         st.session_state["layout_draft"] = updated_layout_rows
