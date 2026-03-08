@@ -387,6 +387,7 @@ def execute_update(
     runtime["last_run_result"] = "running"
     append_event(runtime, "info", f"Run started ({reason})")
     update_runtime_file(github, runtime, "Tracker run started")
+    enable_process_logging = bool(config.get("global", {}).get("enable_process_logging", False))
     process_logs: list[dict[str, Any]] = []
 
     def set_action(text: str) -> None:
@@ -394,7 +395,8 @@ def execute_update(
         runtime["current_action"] = text if state != "paused" else f"{text} (paused)"
 
     def log_http(record: dict[str, Any]) -> None:
-        process_logs.append(record)
+        if enable_process_logging:
+            process_logs.append(record)
 
     config, threads_payload, sample_updates, result = run_update(
         config=config,
@@ -439,7 +441,8 @@ def execute_update(
         append_event(runtime, "info", "Run finished successfully")
 
     persist_update_results(github, threads_payload, sample_updates, summary, runtime)
-    append_process_log(github, "data/process_log.jsonl", process_logs, "Append BladeForums process log")
+    if enable_process_logging and process_logs:
+        append_process_log(github, "data/process_log.jsonl", process_logs, "Append BladeForums process log")
     store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
     return config, threads_payload, runtime, summary
 
@@ -809,6 +812,14 @@ def main() -> None:
             put_json(github, "data/config.json", config, "Update start behavior")
             store_session_docs(config=config)
 
+        global_cfg = config.setdefault("global", {})
+        process_logging_now = bool(global_cfg.get("enable_process_logging", False))
+        process_logging_new = st.toggle("Enable process logging", value=process_logging_now, disabled=read_only)
+        if not read_only and process_logging_new != process_logging_now:
+            global_cfg["enable_process_logging"] = bool(process_logging_new)
+            put_json(github, "data/config.json", config, "Update process logging toggle")
+            store_session_docs(config=config)
+
         st.divider()
         interval_new = st.number_input(
             "Seconds between updates",
@@ -841,7 +852,6 @@ def main() -> None:
             put_json(github, "data/config.json", config, "Update rate limit")
             store_session_docs(config=config)
 
-        global_cfg = config.setdefault("global", {})
         min_delay = float(global_cfg.get("min_delay_seconds", 0.2))
         max_delay = float(global_cfg.get("max_delay_seconds", 1.0))
         delay_cols = st.columns(2)
