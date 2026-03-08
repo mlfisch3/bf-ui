@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import time
 import traceback
 import zipfile
 from datetime import datetime, timezone
@@ -189,13 +190,23 @@ def parse_thread_numeric_id(value: str) -> str | None:
 
 
 def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: str) -> None:
-    try:
-        current, sha = github.get_file(path)
-    except Exception:  # noqa: BLE001
-        current, sha = None, None
-    if current == payload:
-        return
-    github.put_file(path, payload, message, sha)
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            current, sha = github.get_file(path)
+        except Exception:  # noqa: BLE001
+            current, sha = None, None
+        if current == payload:
+            return
+        try:
+            github.put_file(path, payload, message, sha)
+            return
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            is_conflict = "409" in text or "Conflict" in text
+            if not is_conflict or attempt >= attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
 
 
 def load_runtime(source: DataSource) -> dict[str, Any]:
@@ -358,7 +369,6 @@ def execute_update(
     def set_action(text: str) -> None:
         state = config.get("tracker", {}).get("state", "stopped")
         runtime["current_action"] = text if state != "paused" else f"{text} (paused)"
-        update_runtime_file(github, runtime, "Update runtime action")
 
     config, threads_payload, sample_updates, result = run_update(
         config=config,
@@ -638,11 +648,11 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         if github:
             try:
-                payload, sha = github.get_file("data/ui_errors.json")
+                payload, _ = github.get_file("data/ui_errors.json")
             except Exception:  # noqa: BLE001
-                payload, sha = {"errors": []}, None
+                payload = {"errors": []}
             payload.setdefault("errors", []).append({"ts": utc_now(), "error": str(exc), "traceback": traceback.format_exc()})
-            github.put_file("data/ui_errors.json", payload, "Log UI error", sha)
+            put_json(github, "data/ui_errors.json", payload, "Log UI error")
         st.error("Unexpected error")
         st.exception(exc)
         st.stop()
@@ -1569,10 +1579,10 @@ if __name__ == "__main__":
         _, github, _, _ = build_clients()
         if github:
             try:
-                payload, sha = github.get_file("data/ui_errors.json")
+                payload, _ = github.get_file("data/ui_errors.json")
             except Exception:  # noqa: BLE001
-                payload, sha = {"errors": []}, None
+                payload = {"errors": []}
             payload.setdefault("errors", []).append({"ts": utc_now(), "error": str(exc), "traceback": traceback.format_exc()})
-            github.put_file("data/ui_errors.json", payload, "Log UI error", sha)
+            put_json(github, "data/ui_errors.json", payload, "Log UI error")
         st.error("Unexpected error")
         st.exception(exc)
