@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup, Tag
 
 THREAD_HREF_RE = re.compile(r"/threads/[^/]*\.(\d+)(?:/|$)")
 FORUM_NODE_RE = re.compile(r"\.(\d+)(?:/)?$")
-SEQUENTIAL_PAGE_DEPTH = 10
+SEQUENTIAL_PAGE_DEPTH = 20
 
 
 @dataclass
@@ -267,6 +267,7 @@ def run_update(
     threads_payload: dict[str, Any],
     selected_thread_ids: set[str] | None = None,
     set_action: callable | None = None,
+    log_http: callable | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]], UpdateResult]:
     started_at = utc_now()
     requests_made = 0
@@ -340,13 +341,50 @@ def run_update(
                     try:
                         wait_budget()
                         requests_made += 1
-                        resp = session.get(url, headers=_headers(), timeout=20)
+                        request_headers = _headers()
+                        if log_http:
+                            log_http(
+                                {
+                                    "ts": utc_now(),
+                                    "phase": "request",
+                                    "kind": "listing",
+                                    "url": url,
+                                    "attempt": attempt + 1,
+                                    "method": "GET",
+                                    "request_headers": request_headers,
+                                }
+                            )
+                        resp = session.get(url, headers=request_headers, timeout=20)
+                        if log_http:
+                            log_http(
+                                {
+                                    "ts": utc_now(),
+                                    "phase": "response",
+                                    "kind": "listing",
+                                    "url": url,
+                                    "attempt": attempt + 1,
+                                    "status_code": resp.status_code,
+                                    "response_headers": dict(resp.headers),
+                                    "body": resp.text,
+                                }
+                            )
                         if resp.status_code in {403, 429}:
                             time.sleep(6 + attempt * 4)
                         resp.raise_for_status()
                         html = resp.text
                         break
                     except Exception as exc:  # noqa: BLE001
+                        if log_http:
+                            log_http(
+                                {
+                                    "ts": utc_now(),
+                                    "phase": "error",
+                                    "kind": "listing",
+                                    "url": url,
+                                    "attempt": attempt + 1,
+                                    "error": str(exc),
+                                }
+                            )
                         if attempt >= max_retries:
                             errors.append(
                                 {
@@ -413,13 +451,50 @@ def run_update(
             try:
                 wait_budget()
                 requests_made += 1
-                resp = session.get(search_url, headers=_headers(), timeout=20)
+                request_headers = _headers()
+                if log_http:
+                    log_http(
+                        {
+                            "ts": utc_now(),
+                            "phase": "request",
+                            "kind": "search",
+                            "url": search_url,
+                            "attempt": attempt + 1,
+                            "method": "GET",
+                            "request_headers": request_headers,
+                        }
+                    )
+                resp = session.get(search_url, headers=request_headers, timeout=20)
+                if log_http:
+                    log_http(
+                        {
+                            "ts": utc_now(),
+                            "phase": "response",
+                            "kind": "search",
+                            "url": search_url,
+                            "attempt": attempt + 1,
+                            "status_code": resp.status_code,
+                            "response_headers": dict(resp.headers),
+                            "body": resp.text,
+                        }
+                    )
                 if resp.status_code in {403, 429}:
                     time.sleep(6 + attempt * 4)
                 resp.raise_for_status()
                 search_html = resp.text
                 break
             except Exception as exc:  # noqa: BLE001
+                if log_http:
+                    log_http(
+                        {
+                            "ts": utc_now(),
+                            "phase": "error",
+                            "kind": "search",
+                            "url": search_url,
+                            "attempt": attempt + 1,
+                            "error": str(exc),
+                        }
+                    )
                 if attempt >= max_retries:
                     errors.append(
                         {

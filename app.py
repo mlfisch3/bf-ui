@@ -209,6 +209,28 @@ def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: 
             time.sleep(0.15 * (attempt + 1))
 
 
+def append_process_log(github: GithubClient, path: str, records: list[dict[str, Any]], message: str) -> None:
+    if not records:
+        return
+    chunk = "".join(json.dumps(r, sort_keys=True) + "\n" for r in records)
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            current_text, sha = github.get_text_file(path)
+        except Exception:  # noqa: BLE001
+            current_text, sha = "", None
+        new_text = current_text + chunk
+        try:
+            github.put_text_file(path, new_text, message, sha)
+            return
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            is_conflict = "409" in text or "Conflict" in text
+            if not is_conflict or attempt >= attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
 def load_runtime(source: DataSource) -> dict[str, Any]:
     runtime = fetch_or_default(
         source,
@@ -365,16 +387,21 @@ def execute_update(
     runtime["last_run_result"] = "running"
     append_event(runtime, "info", f"Run started ({reason})")
     update_runtime_file(github, runtime, "Tracker run started")
+    process_logs: list[dict[str, Any]] = []
 
     def set_action(text: str) -> None:
         state = config.get("tracker", {}).get("state", "stopped")
         runtime["current_action"] = text if state != "paused" else f"{text} (paused)"
+
+    def log_http(record: dict[str, Any]) -> None:
+        process_logs.append(record)
 
     config, threads_payload, sample_updates, result = run_update(
         config=config,
         threads_payload=threads_payload,
         selected_thread_ids=selected_thread_ids,
         set_action=set_action,
+        log_http=log_http,
     )
 
     by_id = {t["id"]: t for t in threads_payload.get("threads", [])}
@@ -412,6 +439,7 @@ def execute_update(
         append_event(runtime, "info", "Run finished successfully")
 
     persist_update_results(github, threads_payload, sample_updates, summary, runtime)
+    append_process_log(github, "data/process_log.jsonl", process_logs, "Append BladeForums process log")
     store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
     return config, threads_payload, runtime, summary
 
