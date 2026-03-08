@@ -77,3 +77,15 @@ class GithubClient:
             payload["sha"] = sha
         resp = requests.put(url, headers=self._headers(), json=payload, timeout=20)
         resp.raise_for_status()
+
+    def delete_file(self, path: str, message: str, sha: str) -> None:
+        if not self.cfg.token:
+            raise RuntimeError("GITHUB_TOKEN not configured")
+        url = f"{self.base_url}/{path}"
+        payload = {
+            "message": message,
+            "sha": sha,
+            "branch": self.cfg.branch,
+        }
+        resp = requests.delete(url, headers=self._headers(), json=payload, timeout=20)
+        resp.raise_for_status()

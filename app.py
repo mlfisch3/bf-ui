@@ -76,7 +76,7 @@ st.markdown(
 )
 
 NY_TZ = ZoneInfo("America/New_York")
-THREAD_ID_INPUT_RE = re.compile(r"(?:^|\.)(\d+)(?:/)?$")
+THREAD_ID_INPUT_RE = re.compile(r"(?:^|\.)(\d+)(?:/)?(?:[#?].*)?$")
 TITLE_COLORS = [
     "#1f77b4",
     "#ff7f0e",
@@ -726,6 +726,35 @@ def main() -> None:
     st.sidebar.header("Controls")
     side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Layout", "Display", "Stats", "Export"])
 
+    def hard_delete_thread(thread_id: str) -> None:
+        threads_doc, threads_sha = github.get_file("data/threads.json")
+        threads_doc["threads"] = [t for t in threads_doc.get("threads", []) if str(t.get("id")) != str(thread_id)]
+        for idx, thread in enumerate(threads_doc.get("threads", [])):
+            thread["order"] = idx
+        github.put_file("data/threads.json", threads_doc, "Hard delete thread", threads_sha)
+
+        try:
+            _, sample_sha = github.get_text_file(f"data/samples/{thread_id}.json")
+            github.delete_file(f"data/samples/{thread_id}.json", "Hard delete thread sample history", sample_sha)
+        except Exception:  # noqa: BLE001
+            pass
+
+        catalog_doc = load_catalog(source)
+        catalog_doc["threads"] = [t for t in catalog_doc.get("threads", []) if str(t.get("id")) != str(thread_id)]
+        put_json(github, "data/thread_catalog.json", catalog_doc, "Hard delete thread from catalog")
+
+        st.session_state.setdefault("sample_cache", {}).pop(str(thread_id), None)
+        st.session_state["threads_override"] = threads_doc.get("threads", [])
+        st.session_state["layout_applied"] = [r for r in st.session_state.get("layout_applied", []) if str(r.get("thread_id")) != str(thread_id)]
+        st.session_state["layout_draft"] = [r for r in st.session_state.get("layout_draft", []) if str(r.get("thread_id")) != str(thread_id)]
+        st.session_state["tracker_applied"] = [r for r in st.session_state.get("tracker_applied", []) if str(r.get("thread_id")) != str(thread_id)]
+        st.session_state["tracker_draft"] = [r for r in st.session_state.get("tracker_draft", []) if str(r.get("thread_id")) != str(thread_id)]
+        pending_ids = set(st.session_state.get("pending_registration_ids", []))
+        pending_ids.discard(str(thread_id))
+        st.session_state["pending_registration_ids"] = sorted(pending_ids)
+        store_session_docs(threads_payload=threads_doc, catalog=catalog_doc)
+        st.rerun()
+
     with side_tabs[3]:
         st.subheader("Display options")
         style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
@@ -936,6 +965,7 @@ def main() -> None:
 
     with side_tabs[1]:
         st.subheader("Add thread")
+        st.caption("Paste a thread URL or numeric ID. The numeric ID is extracted automatically.")
         with st.form("add_thread_form"):
             id_or_url = st.text_input("Thread URL or numeric ID")
             display_name = st.text_input("Display name (optional)")
@@ -955,7 +985,7 @@ def main() -> None:
                         for t in threads
                     )
                     if duplicate:
-                        st.warning("Thread already exists")
+                        st.warning("Thread already exists in active tracker list. Hard-delete it below to re-add cleanly.")
                     else:
                         label = display_name.strip() if display_name.strip() else f"Thread {numeric}"
                         new_id = thread_id_for(f"{numeric}-{subforum_key}", subforum_key)
@@ -985,6 +1015,20 @@ def main() -> None:
                         st.session_state["pending_registration_ids"] = sorted(pending_ids)
                         store_session_docs(threads_payload=threads_doc)
                         st.rerun()
+
+        st.divider()
+        st.subheader("Hard delete thread")
+        thread_options_delete = sorted_threads(threads_payload)
+        if not thread_options_delete:
+            st.caption("No threads available")
+        else:
+            delete_labels = {
+                f"{t.get('display_name') or t.get('id')} ({t.get('thread_numeric_id') or 'MISSING'})": t.get("id")
+                for t in thread_options_delete
+            }
+            delete_label = st.selectbox("Thread to hard delete", options=list(delete_labels.keys()), key="hard_delete_thread_select")
+            if st.button("Hard delete selected thread", disabled=read_only):
+                hard_delete_thread(str(delete_labels[delete_label]))
 
         st.divider()
         st.subheader("Edit thread numeric ID")
@@ -1376,7 +1420,7 @@ def main() -> None:
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
                 with st.container():
-                    controls = st.columns([1, 1, 1])
+                    controls = st.columns([1, 1, 1, 1])
                     if controls[0].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
                         execute_update(
                             github,
@@ -1399,6 +1443,8 @@ def main() -> None:
                             lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
                             "Remove thread",
                         )
+                    if controls[3].button("DEL", key=f"hard_remove_{thread_id}", disabled=read_only, help="Hard delete thread + history"):
+                        hard_delete_thread(str(thread_id))
 
                     if not chart_opts["graph_only"]:
                         st.write(
