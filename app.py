@@ -683,9 +683,9 @@ def main() -> None:
     st.session_state["tracker_draft"] = sync_tracker_rows(threads_sorted, st.session_state.get("tracker_draft"))
 
     st.sidebar.header("Controls")
-    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Layout", "Subforums", "Display", "Stats", "Export"])
+    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Layout", "Display", "Stats", "Export"])
 
-    with side_tabs[4]:
+    with side_tabs[3]:
         st.subheader("Display options")
         style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
         line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0, key="disp_line_shape")
@@ -1205,40 +1205,7 @@ def main() -> None:
                 st.session_state["layout_applied"] = _deepcopy_doc(updated_layout_rows)
                 st.rerun()
 
-    with side_tabs[3]:
-        st.subheader("Subforum retrieval limits")
-        st.caption("Increase max pages if a tracked thread has moved deeper in a subforum.")
-        apply_all_cols = st.columns([1.2, 1])
-        apply_all_value = apply_all_cols[0].number_input(
-            "Set max pages for all subforums",
-            min_value=1,
-            max_value=200,
-            value=10,
-            step=1,
-            disabled=read_only,
-            help="Higher values search deeper pages but increase request load and runtime.",
-        )
-        apply_all_clicked = apply_all_cols[1].button("Apply to all", disabled=read_only)
-        rows = [{"Subforum": s["name"], "Max pages": int(s.get("max_pages_per_update", 3))} for s in config.get("subforums", [])]
-        if apply_all_clicked:
-            rows = [{"Subforum": r["Subforum"], "Max pages": int(apply_all_value)} for r in rows]
-        edited = st.data_editor(
-            pd.DataFrame(rows),
-            hide_index=True,
-            disabled=read_only,
-            num_rows="fixed",
-            column_config={
-                "Subforum": st.column_config.TextColumn("Subforum", disabled=True),
-                "Max pages": st.column_config.NumberColumn("Max pages", min_value=1, max_value=200),
-            },
-        )
-        if st.button("Save limits", disabled=read_only):
-            for idx, row in edited.iterrows():
-                config["subforums"][idx]["max_pages_per_update"] = int(row["Max pages"])
-            put_json(github, "data/config.json", config, "Update subforum limits")
-            store_session_docs(config=config)
-
-    with side_tabs[5]:
+    with side_tabs[4]:
         st.subheader("Thread update counts")
         stats_rows = []
         for thread in sorted_threads(threads_payload):
@@ -1254,7 +1221,7 @@ def main() -> None:
         else:
             st.caption("No thread data yet")
 
-    with side_tabs[6]:
+    with side_tabs[5]:
         st.subheader("Export")
         export_threads = []
         for thread in sorted_threads(threads_payload):

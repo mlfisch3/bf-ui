@@ -6,12 +6,15 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 
 THREAD_HREF_RE = re.compile(r"/threads/[^/]*\.(\d+)(?:/|$)")
+FORUM_NODE_RE = re.compile(r"\.(\d+)(?:/)?$")
+SEQUENTIAL_PAGE_DEPTH = 10
 
 
 @dataclass
@@ -58,6 +61,22 @@ def build_page_url(base: str, page: int) -> str:
     if base.endswith("/"):
         return f"{base}page-{page}"
     return f"{base}/page-{page}"
+
+
+def extract_forum_node_id(subforum_url: str | None) -> str | None:
+    if not subforum_url:
+        return None
+    match = FORUM_NODE_RE.search(subforum_url.rstrip("/"))
+    return match.group(1) if match else None
+
+
+def build_search_url(keyword: str, node_id: str) -> str:
+    # Guest-compatible search URL form.
+    q = quote_plus(keyword)
+    return (
+        "https://www.bladeforums.com/search/"
+        f"?q={q}&t=post&c%5Bchild_nodes%5D=1&c%5Bnodes%5D%5B0%5D={node_id}&c%5Btitle_only%5D=1&o=relevance"
+    )
 
 
 def parse_thread_numeric_id_from_href(href: str | None) -> str | None:
@@ -155,6 +174,62 @@ def parse_listing_rows(html: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_search_rows(html: str) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, container in enumerate(_candidate_containers(soup)):
+        link = _extract_thread_link(container)
+        if not link:
+            continue
+        href = str(link.get("href") or "")
+        thread_numeric_id = parse_thread_numeric_id_from_href(href)
+        if not thread_numeric_id or thread_numeric_id in seen_ids:
+            continue
+        seen_ids.add(thread_numeric_id)
+        rows.append(
+            {
+                "thread_numeric_id": thread_numeric_id,
+                "title": " ".join(link.get_text(" ").split()).strip(),
+                "views": _extract_views(container),
+                "position": idx,
+            }
+        )
+    if rows:
+        return rows
+    for idx, link in enumerate(soup.select("a[href*='/threads/']")):
+        href = str(link.get("href") or "")
+        thread_numeric_id = parse_thread_numeric_id_from_href(href)
+        if not thread_numeric_id or thread_numeric_id in seen_ids:
+            continue
+        seen_ids.add(thread_numeric_id)
+        rows.append(
+            {
+                "thread_numeric_id": thread_numeric_id,
+                "title": " ".join(link.get_text(" ").split()).strip(),
+                "views": None,
+                "position": idx,
+            }
+        )
+    return rows
+
+
+def build_search_keywords(thread: dict[str, Any]) -> str | None:
+    raw = (
+        thread.get("current_title")
+        or thread.get("last_seen_title")
+        or thread.get("display_name")
+        or thread.get("title")
+    )
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9 ]+", " ", str(raw))
+    words = [w for w in cleaned.split() if len(w) >= 2]
+    if not words:
+        return None
+    return " ".join(words[:6])
+
+
 def _headers() -> dict[str, str]:
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -250,7 +325,8 @@ def run_update(
             continue
 
         numeric_id = str(thread.get("thread_numeric_id"))
-        max_pages = int(subforum.get("max_pages_per_update", 3))
+        max_pages = SEQUENTIAL_PAGE_DEPTH
+        found = False
 
         for page in range(1, max_pages + 1):
             subforum_pages = page_cache.setdefault(subforum_key, {})
@@ -315,10 +391,83 @@ def run_update(
                     "page": page,
                     "above": row.get("position"),
                     "observed_title": row.get("title"),
+                    "source": "listing",
                 }
             )
             updated_threads += 1
+            found = True
             break
+        if found:
+            continue
+
+        forum_node_id = extract_forum_node_id(subforum.get("url"))
+        keywords = build_search_keywords(thread)
+        if not forum_node_id or not keywords:
+            continue
+
+        if set_action:
+            set_action(f"Searching {subforum['name']} for thread {numeric_id}")
+        search_url = build_search_url(keywords, forum_node_id)
+        search_html = None
+        for attempt in range(max_retries + 1):
+            try:
+                wait_budget()
+                requests_made += 1
+                resp = session.get(search_url, headers=_headers(), timeout=20)
+                if resp.status_code in {403, 429}:
+                    time.sleep(6 + attempt * 4)
+                resp.raise_for_status()
+                search_html = resp.text
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt >= max_retries:
+                    errors.append(
+                        {
+                            "subforum_key": subforum_key,
+                            "error": f"Search failed ({search_url}): {exc}",
+                        }
+                    )
+                else:
+                    time.sleep(2 + attempt * 2)
+        if not search_html:
+            continue
+
+        search_rows = parse_search_rows(search_html)
+        search_by_id = {row["thread_numeric_id"]: row for row in search_rows}
+        row = search_by_id.get(numeric_id)
+        if not row:
+            continue
+
+        if row.get("title"):
+            thread["last_seen_title"] = row["title"]
+        if row.get("views") is None:
+            continue
+
+        thread["last_seen_at"] = utc_now()
+        thread["last_view_count"] = int(row["views"])
+        thread["last_found_page"] = None
+        thread["last_found_above"] = row.get("position")
+        thread_id = thread["id"]
+        payload = samples_updates.setdefault(
+            thread_id,
+            {
+                "thread_id": thread_id,
+                "title": thread.get("display_name") or thread.get("title") or f"Thread {numeric_id}",
+                "thread_numeric_id": numeric_id,
+                "samples": [],
+            },
+        )
+        payload["samples"].append(
+            {
+                "ts": utc_now(),
+                "views": int(row["views"]),
+                "page": None,
+                "above": row.get("position"),
+                "observed_title": row.get("title"),
+                "source": "search",
+            }
+        )
+        updated_threads += 1
 
     finished_at = utc_now()
     result = UpdateResult(
