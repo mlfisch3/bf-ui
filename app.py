@@ -2585,13 +2585,23 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:  # noqa: BLE001
-        _, github, _, _ = build_clients()
+        log_error: str | None = None
+        try:
+            _, github, _, _ = build_clients()
+        except Exception as inner:  # noqa: BLE001
+            github = None
+            log_error = str(inner)
         if github:
             try:
                 payload, _ = github.get_file("data/ui_errors.json")
             except Exception:  # noqa: BLE001
                 payload = {"errors": []}
             payload.setdefault("errors", []).append({"ts": utc_now(), "error": str(exc), "traceback": traceback.format_exc()})
-            put_json(github, "data/ui_errors.json", payload, "Log UI error")
+            try:
+                put_json(github, "data/ui_errors.json", payload, "Log UI error")
+            except Exception as inner:  # noqa: BLE001
+                log_error = str(inner)
         st.error("Unexpected error")
+        if log_error:
+            st.caption(f"UI error log persistence failed: {log_error}")
         st.exception(exc)
