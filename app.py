@@ -243,6 +243,26 @@ def append_process_log(github: GithubClient, path: str, records: list[dict[str, 
             time.sleep(0.15 * (attempt + 1))
 
 
+def put_text(github: GithubClient, path: str, text_payload: str, message: str) -> None:
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            current_text, sha = github.get_text_file(path)
+        except Exception:  # noqa: BLE001
+            current_text, sha = "", None
+        if current_text == text_payload:
+            return
+        try:
+            github.put_text_file(path, text_payload, message, sha)
+            return
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            is_conflict = "409" in text or "Conflict" in text
+            if not is_conflict or attempt >= attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
 def load_runtime(source: DataSource) -> dict[str, Any]:
     runtime = fetch_or_default(
         source,
@@ -324,13 +344,27 @@ def load_selftest_report(source: DataSource) -> dict[str, Any]:
     return payload
 
 
-def append_selftest_log(report: dict[str, Any], action: str, ok: bool, details: str) -> None:
+def append_selftest_log(
+    report: dict[str, Any],
+    action: str,
+    ok: bool,
+    details: str,
+    *,
+    expected: str | None = None,
+    observed: str | None = None,
+    remedy: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
     report.setdefault("logs", []).append(
         {
             "ts": utc_now(),
             "action": action,
             "ok": bool(ok),
             "details": details,
+            "expected": expected,
+            "observed": observed,
+            "remedy": remedy,
+            "meta": meta or {},
         }
     )
     report["logs"] = report["logs"][-600:]
@@ -846,6 +880,13 @@ def main() -> None:
         put_json(github, "data/selftest_config.json", selftest_cfg, "Update self-test config")
         put_json(github, "data/selftest_runtime.json", selftest_runtime, "Update self-test runtime")
         put_json(github, "data/selftest_report.json", selftest_report, "Update self-test report")
+        text_lines = [json.dumps(item, sort_keys=True) for item in selftest_report.get("logs", [])]
+        put_text(
+            github,
+            "data/selftest_verbose_log.jsonl",
+            ("\n".join(text_lines) + ("\n" if text_lines else "")),
+            "Update self-test verbose log",
+        )
 
     def ensure_selftest_entry() -> str:
         target = selftest_cfg.get("target", {})
@@ -896,31 +937,102 @@ def main() -> None:
         st.session_state["layout_draft"] = [r for r in st.session_state.get("layout_draft", []) if str(r.get("thread_id")) != thread_id]
         store_session_docs(threads_payload=threads_doc, catalog=catalog_doc)
 
-    def run_isolated_thread_update(thread_id: str, reason: str) -> tuple[bool, str]:
+    def run_isolated_thread_update(thread_id: str, reason: str) -> tuple[bool, str, list[dict[str, Any]]]:
         tmp_threads = _deepcopy_doc(threads_payload)
         for thread in tmp_threads.get("threads", []):
             if str(thread.get("id")) == str(thread_id):
                 thread["status"] = "active"
                 break
+        trace_events: list[dict[str, Any]] = []
         fast_cfg = _deepcopy_doc(config)
         fast_global = fast_cfg.setdefault("global", {})
         fast_global["min_delay_seconds"] = 0.0
         fast_global["max_delay_seconds"] = 0.2
         fast_global["max_retries"] = 0
+        trace_events.append(
+            {
+                "ts": utc_now(),
+                "action": "update_begin",
+                "ok": True,
+                "details": f"Running isolated update ({reason})",
+                "expected": "One sample should be appended for self-test target",
+                "observed": "Update started",
+                "remedy": None,
+                "meta": {"reason": reason},
+            }
+        )
+
+        def _trace_action(msg: str) -> None:
+            method = "search" if "Searching " in msg else "sequential_paging"
+            trace_events.append(
+                {
+                    "ts": utc_now(),
+                    "action": "tracker_action",
+                    "ok": True,
+                    "details": msg,
+                    "expected": "Tracker should use sequential paging first, then search fallback if needed",
+                    "observed": msg,
+                    "remedy": None,
+                    "meta": {"method": method},
+                }
+            )
+
+        def _trace_http(record: dict[str, Any]) -> None:
+            phase = str(record.get("phase", "unknown"))
+            kind = str(record.get("kind", "unknown"))
+            status_code = record.get("status_code")
+            ok = bool(status_code is None or int(status_code) < 400)
+            trace_events.append(
+                {
+                    "ts": record.get("ts", utc_now()),
+                    "action": f"http_{phase}",
+                    "ok": ok,
+                    "details": f"{kind} {phase} {record.get('url')}",
+                    "expected": "2xx responses and parseable thread row",
+                    "observed": f"status={status_code}" if status_code is not None else str(record.get("error") or "request_sent"),
+                    "remedy": "retry or fallback to search" if not ok else None,
+                    "meta": record,
+                }
+            )
+
         _, updated_threads_doc, sample_updates, result = run_update(
             config=fast_cfg,
             threads_payload=tmp_threads,
             selected_thread_ids={thread_id},
-            set_action=None,
-            log_http=None,
+            set_action=_trace_action,
+            log_http=_trace_http,
             max_pages_override=3,
             enable_search_fallback=True,
             should_abort=lambda: bool(selftest_runtime.get("abort_requested")),
         )
         if result.errors:
-            return False, f"update errors: {result.errors}"
+            trace_events.append(
+                {
+                    "ts": utc_now(),
+                    "action": "update_result",
+                    "ok": False,
+                    "details": "Update failed with errors",
+                    "expected": "No tracker errors",
+                    "observed": str(result.errors),
+                    "remedy": "diagnostic + re-ensure target thread + retry",
+                    "meta": {"errors": result.errors},
+                }
+            )
+            return False, f"update errors: {result.errors}", trace_events
         if thread_id not in sample_updates:
-            return False, "no sample update returned"
+            trace_events.append(
+                {
+                    "ts": utc_now(),
+                    "action": "update_result",
+                    "ok": False,
+                    "details": "No sample update returned for self-test target",
+                    "expected": "Sample payload for target thread",
+                    "observed": "sample_updates missing target id",
+                    "remedy": "diagnostic + verify parse + retry",
+                    "meta": {"thread_id": thread_id},
+                }
+            )
+            return False, "no sample update returned", trace_events
         # Persist only the updated target thread and its samples.
         real_threads, real_sha = github.get_file("data/threads.json")
         by_id_new = {str(t.get("id")): t for t in updated_threads_doc.get("threads", [])}
@@ -951,7 +1063,19 @@ def main() -> None:
         st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(sample_payload)
         st.session_state["threads_override"] = real_threads.get("threads", [])
         store_session_docs(threads_payload=real_threads)
-        return True, "ok"
+        trace_events.append(
+            {
+                "ts": utc_now(),
+                "action": "update_result",
+                "ok": True,
+                "details": "Isolated update persisted",
+                "expected": "Thread + sample files updated",
+                "observed": f"sample_count={len(sample_payload.get('samples', []))}",
+                "remedy": None,
+                "meta": {"thread_id": thread_id},
+            }
+        )
+        return True, "ok", trace_events
 
     def process_selftest_tick() -> None:
         if selftest_runtime.get("status") != "running":
@@ -982,20 +1106,51 @@ def main() -> None:
 
         if stage.startswith("update_"):
             update_no = int(stage.split("_")[1])
-            append_selftest_log(selftest_report, f"update_{update_no}", True, f"Attempting retrieval {update_no}")
-            ok, info = run_isolated_thread_update(target_thread_id, f"selftest_{update_no}")
+            append_selftest_log(
+                selftest_report,
+                f"update_{update_no}",
+                True,
+                f"Attempting retrieval {update_no}",
+                expected="Tracker should retrieve live view count for self-test target",
+                observed="Update requested",
+            )
+            ok, info, trace_events = run_isolated_thread_update(target_thread_id, f"selftest_{update_no}")
+            selftest_report.setdefault("logs", []).extend(trace_events)
+            selftest_report["logs"] = selftest_report["logs"][-1200:]
             if not ok:
                 if "Aborted" in info or "aborted" in info:
                     selftest_runtime["status"] = "aborted"
                     selftest_runtime["stage"] = "aborted"
                     selftest_runtime["run_finished_at"] = utc_now()
-                    append_selftest_log(selftest_report, f"update_{update_no}", False, "Aborted during update step")
+                    append_selftest_log(
+                        selftest_report,
+                        f"update_{update_no}",
+                        False,
+                        "Aborted during update step",
+                        expected="Abort request should stop update quickly",
+                        observed=info,
+                    )
                     persist_selftest_docs()
                     return
                 selftest_runtime["repair_attempts"] = int(selftest_runtime.get("repair_attempts", 0)) + 1
-                append_selftest_log(selftest_report, f"update_{update_no}", False, info)
+                append_selftest_log(
+                    selftest_report,
+                    f"update_{update_no}",
+                    False,
+                    info,
+                    expected="Update should append one sample",
+                    observed=info,
+                    remedy="re-ensure self-test thread and retry",
+                )
                 if int(selftest_runtime.get("repair_attempts", 0)) <= int(selftest_cfg.get("max_repair_attempts", 2)):
-                    append_selftest_log(selftest_report, "diagnostic", True, "Applying remedy: re-ensure self-test thread entry")
+                    append_selftest_log(
+                        selftest_report,
+                        "diagnostic",
+                        True,
+                        "Applying remedy: re-ensure self-test thread entry",
+                        expected="Thread entry should exist and be valid",
+                        observed="Remedy applied",
+                    )
                     ensure_selftest_entry()
                     selftest_runtime["next_action_at"] = utc_now()
                     persist_selftest_docs()
@@ -1013,7 +1168,15 @@ def main() -> None:
                 samples_doc = {"samples": []}
             count = len(samples_doc.get("samples", []))
             if count < update_no:
-                append_selftest_log(selftest_report, f"verify_{update_no}", False, "No samples recorded banner condition failed")
+                append_selftest_log(
+                    selftest_report,
+                    f"verify_{update_no}",
+                    False,
+                    "No samples recorded banner condition failed",
+                    expected=f"At least {update_no} samples recorded for self-test thread",
+                    observed=f"samples={count}",
+                    remedy="run diagnostic + retry if attempts remain",
+                )
                 selftest_runtime["status"] = "failed"
                 selftest_runtime["stage"] = "failed"
                 selftest_runtime["last_error"] = "No samples recorded"
@@ -1021,7 +1184,14 @@ def main() -> None:
                 persist_selftest_docs()
                 return
 
-            append_selftest_log(selftest_report, f"verify_{update_no}", True, f"Samples count now {count}")
+            append_selftest_log(
+                selftest_report,
+                f"verify_{update_no}",
+                True,
+                f"Samples count now {count}",
+                expected=f"At least {update_no} samples present and card should not show 'No samples recorded'",
+                observed=f"samples={count}",
+            )
             if update_no >= 3:
                 selftest_runtime["status"] = "passed"
                 selftest_runtime["stage"] = "complete"
@@ -2031,11 +2201,27 @@ def main() -> None:
         st.markdown("**Self-Test Console (verbose)**")
         logs = selftest_report.get("logs", [])
         if logs:
+            last = logs[-1]
+            st.caption(
+                f"Current/Latest: {last.get('action')} | expected: {last.get('expected') or 'n/a'} | observed: {last.get('observed') or last.get('details')}"
+            )
             lines = [
-                f"{item.get('ts')} | {'OK' if item.get('ok') else 'FAIL'} | {item.get('action')} | {item.get('details')}"
+                (
+                    f"{item.get('ts')} | {'OK' if item.get('ok') else 'FAIL'} | {item.get('action')} | "
+                    f"expected={item.get('expected') or 'n/a'} | observed={item.get('observed') or 'n/a'} | "
+                    f"details={item.get('details')}"
+                    + (f" | remedy={item.get('remedy')}" if item.get("remedy") else "")
+                )
                 for item in logs[-300:]
             ]
             st.code("\n".join(lines), language="text")
+            st.download_button(
+                "Download self-test verbose log",
+                data="".join(json.dumps(item, sort_keys=True) + "\n" for item in logs),
+                file_name=f"selftest_verbose_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}.jsonl",
+                mime="application/json",
+                key="download_selftest_verbose_log",
+            )
         else:
             st.caption("No self-test logs yet")
 
