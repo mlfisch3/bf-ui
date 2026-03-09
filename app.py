@@ -718,7 +718,11 @@ def build_axis_ticks(start_ts: pd.Timestamp, end_ts: pd.Timestamp, count: int = 
 
 
 def sorted_threads(threads_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    threads = threads_payload.get("threads", [])
+    threads = [
+        t
+        for t in threads_payload.get("threads", [])
+        if not bool(t.get("is_self_test")) and not bool(t.get("is_selftest")) and not str(t.get("id", "")).startswith("selftest-")
+    ]
     return sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
 
 
@@ -1588,8 +1592,13 @@ def main() -> None:
                 else:
                     threads_doc, sha = github.get_file("data/threads.json")
                     threads = threads_doc.get("threads", [])
+                    selftest_id = selftest_thread_id(selftest_cfg.get("target", {}))
                     duplicate = any(
-                        t.get("subforum_key") == subforum_key and str(t.get("thread_numeric_id")) == str(numeric)
+                        t.get("subforum_key") == subforum_key
+                        and str(t.get("thread_numeric_id")) == str(numeric)
+                        and str(t.get("id")) != str(selftest_id)
+                        and not bool(t.get("is_self_test"))
+                        and not bool(t.get("is_selftest"))
                         for t in threads
                     )
                     if duplicate:

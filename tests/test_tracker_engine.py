@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from ui.tracker_engine import due_for_run, parse_listing_rows, parse_thread_numeric_id_from_href
+from ui.tracker_engine import due_for_run, parse_listing_rows, parse_search_rows, parse_thread_numeric_id_from_href
 
 
 def test_parse_thread_numeric_id_from_href() -> None:
@@ -31,3 +31,16 @@ def test_due_for_run() -> None:
     future = (now + timedelta(minutes=30)).isoformat()
     assert due_for_run(past, now=now)
     assert not due_for_run(future, now=now)
+
+
+def test_parse_search_rows_extracts_views_from_text() -> None:
+    html = """
+    <div class="contentRow">
+      <a href="/threads/spyderco-dodo-satin-m4-jade-g-10-lnib.2066634/">Spyderco Dodo</a>
+      <div class="contentRow-minor">Replies: 0 Views: 1,234</div>
+    </div>
+    """
+    rows = parse_search_rows(html)
+    assert rows
+    assert rows[0]["thread_numeric_id"] == "2066634"
+    assert rows[0]["views"] == 1234

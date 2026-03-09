@@ -152,6 +152,15 @@ def _extract_views(container: Tag) -> int | None:
     return None
 
 
+def _extract_views_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    match = re.search(r"\bviews?\b\s*[:\-]?\s*([0-9][0-9,]*(?:\.\d+)?[KkMm]?)", text, flags=re.IGNORECASE)
+    if match:
+        return parse_abbrev_number(match.group(1))
+    return None
+
+
 def parse_listing_rows(html: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     rows: list[dict[str, Any]] = []
@@ -178,6 +187,31 @@ def parse_search_rows(html: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    # Prefer search-result specific containers first.
+    for idx, container in enumerate(soup.select(".contentRow, .searchResult, .structItem--searchResult")):
+        link = container.select_one("a[href*='/threads/']") or _extract_thread_link(container)
+        if not link:
+            continue
+        href = str(link.get("href") or "")
+        thread_numeric_id = parse_thread_numeric_id_from_href(href)
+        if not thread_numeric_id or thread_numeric_id in seen_ids:
+            continue
+        seen_ids.add(thread_numeric_id)
+        title = " ".join(link.get_text(" ").split()).strip()
+        views = _extract_views(container)
+        if views is None:
+            views = _extract_views_from_text(container.get_text(" ", strip=True))
+        rows.append(
+            {
+                "thread_numeric_id": thread_numeric_id,
+                "title": title,
+                "views": views,
+                "position": idx,
+            }
+        )
+    if rows:
+        return rows
+
     for idx, container in enumerate(_candidate_containers(soup)):
         link = _extract_thread_link(container)
         if not link:
@@ -191,7 +225,7 @@ def parse_search_rows(html: str) -> list[dict[str, Any]]:
             {
                 "thread_numeric_id": thread_numeric_id,
                 "title": " ".join(link.get_text(" ").split()).strip(),
-                "views": _extract_views(container),
+                "views": _extract_views(container) or _extract_views_from_text(container.get_text(" ", strip=True)),
                 "position": idx,
             }
         )
@@ -251,6 +285,8 @@ def _headers() -> dict[str, str]:
 def _ordered_active_threads(threads: list[dict[str, Any]], selected_thread_ids: set[str] | None) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for thread in threads:
+        if bool(thread.get("is_self_test")) or bool(thread.get("is_selftest")):
+            continue
         if thread.get("status", "active") != "active":
             continue
         if not thread.get("thread_numeric_id"):
