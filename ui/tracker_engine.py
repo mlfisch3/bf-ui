@@ -285,7 +285,10 @@ def _headers() -> dict[str, str]:
 def _ordered_active_threads(threads: list[dict[str, Any]], selected_thread_ids: set[str] | None) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for thread in threads:
-        if bool(thread.get("is_self_test")) or bool(thread.get("is_selftest")):
+        # Keep self-test thread out of normal tracker runs, but allow explicitly
+        # targeted isolated runs (selected_thread_ids contains the self-test id).
+        is_self_test = bool(thread.get("is_self_test")) or bool(thread.get("is_selftest"))
+        if is_self_test and not (selected_thread_ids and thread.get("id") in selected_thread_ids):
             continue
         if thread.get("status", "active") != "active":
             continue
