@@ -7,7 +7,7 @@ import re
 import time
 import traceback
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -259,6 +259,69 @@ def load_catalog(source: DataSource) -> dict[str, Any]:
     payload = fetch_or_default(source, "data/thread_catalog.json", {"schema_version": 1, "threads": []})
     payload.setdefault("threads", [])
     return payload
+
+
+def load_selftest_config(source: DataSource) -> dict[str, Any]:
+    payload = fetch_or_default(
+        source,
+        "data/selftest_config.json",
+        {
+            "schema_version": 1,
+            "target": {
+                "thread_numeric_id": "2066634",
+                "subforum_key": "for-sale-folding-knives-individual.892",
+                "display_name": "Self-Test Target: Dodo",
+            },
+            "delay_seconds": 4,
+            "max_repair_attempts": 2,
+        },
+    )
+    payload.setdefault("target", {})
+    payload.setdefault("delay_seconds", 4)
+    payload.setdefault("max_repair_attempts", 2)
+    return payload
+
+
+def load_selftest_runtime(source: DataSource) -> dict[str, Any]:
+    payload = fetch_or_default(
+        source,
+        "data/selftest_runtime.json",
+        {
+            "status": "idle",
+            "stage": "idle",
+            "run_started_at": None,
+            "run_finished_at": None,
+            "abort_requested": False,
+            "thread_id": None,
+            "next_action_at": None,
+            "repair_attempts": 0,
+            "last_error": None,
+            "last_result": None,
+        },
+    )
+    payload.setdefault("status", "idle")
+    payload.setdefault("stage", "idle")
+    payload.setdefault("abort_requested", False)
+    payload.setdefault("repair_attempts", 0)
+    return payload
+
+
+def load_selftest_report(source: DataSource) -> dict[str, Any]:
+    payload = fetch_or_default(source, "data/selftest_report.json", {"schema_version": 1, "logs": []})
+    payload.setdefault("logs", [])
+    return payload
+
+
+def append_selftest_log(report: dict[str, Any], action: str, ok: bool, details: str) -> None:
+    report.setdefault("logs", []).append(
+        {
+            "ts": utc_now(),
+            "action": action,
+            "ok": bool(ok),
+            "details": details,
+        }
+    )
+    report["logs"] = report["logs"][-600:]
 
 
 def upsert_catalog_entries(catalog: dict[str, Any], threads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -635,6 +698,13 @@ def rows_dirty(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
     return json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True)
 
 
+def selftest_thread_id(target: dict[str, Any]) -> str:
+    return thread_id_for(
+        f"selftest-{target.get('thread_numeric_id')}-{target.get('subforum_key')}",
+        str(target.get("subforum_key", "selftest")),
+    )
+
+
 def run_local_update_if_due(
     github: GithubClient | None,
     config: dict[str, Any],
@@ -676,6 +746,9 @@ def main() -> None:
     try:
         force_reload = bool(st.session_state.pop("force_reload_docs", False))
         config, threads_payload, runtime, catalog = init_session_docs(source, force_reload=force_reload)
+        selftest_cfg = load_selftest_config(source)
+        selftest_runtime = load_selftest_runtime(source)
+        selftest_report = load_selftest_report(source)
     except Exception as exc:  # noqa: BLE001
         if github:
             try:
@@ -716,6 +789,8 @@ def main() -> None:
     state = tracker_cfg.get("state", "stopped")
     if state == "running":
         st_autorefresh(interval=15000, key="tracker_refresh")
+    if selftest_runtime.get("status") == "running":
+        st_autorefresh(interval=1500, key="selftest_refresh")
 
     threads_sorted = sorted_threads(threads_payload)
     st.session_state["layout_applied"] = sync_layout_rows(threads_sorted, st.session_state.get("layout_applied"))
@@ -754,6 +829,183 @@ def main() -> None:
         st.session_state["pending_registration_ids"] = sorted(pending_ids)
         store_session_docs(threads_payload=threads_doc, catalog=catalog_doc)
         st.rerun()
+
+    def persist_selftest_docs() -> None:
+        put_json(github, "data/selftest_config.json", selftest_cfg, "Update self-test config")
+        put_json(github, "data/selftest_runtime.json", selftest_runtime, "Update self-test runtime")
+        put_json(github, "data/selftest_report.json", selftest_report, "Update self-test report")
+
+    def ensure_selftest_entry() -> str:
+        target = selftest_cfg.get("target", {})
+        thread_id = selftest_thread_id(target)
+        threads_doc, threads_sha = github.get_file("data/threads.json")
+        threads = threads_doc.get("threads", [])
+        existing = next((t for t in threads if str(t.get("id")) == thread_id), None)
+        if not existing:
+            order_val = max([x.get("order", -1) for x in threads] + [-1]) + 1
+            threads.append(
+                {
+                    "id": thread_id,
+                    "display_name": target.get("display_name") or f"Self-Test {target.get('thread_numeric_id')}",
+                    "thread_numeric_id": str(target.get("thread_numeric_id")),
+                    "subforum_key": target.get("subforum_key"),
+                    "status": "paused",
+                    "include_in_adhoc": False,
+                    "order": order_val,
+                    "created_at": utc_now(),
+                    "title_history": [],
+                    "title_color_map": {},
+                    "is_self_test": True,
+                }
+            )
+            threads_doc["threads"] = threads
+            github.put_file("data/threads.json", threads_doc, "Ensure self-test thread", threads_sha)
+            st.session_state["threads_override"] = threads
+            store_session_docs(threads_payload=threads_doc)
+        return thread_id
+
+    def purge_selftest_traces() -> None:
+        target = selftest_cfg.get("target", {})
+        thread_id = selftest_thread_id(target)
+        threads_doc, threads_sha = github.get_file("data/threads.json")
+        threads_doc["threads"] = [t for t in threads_doc.get("threads", []) if str(t.get("id")) != thread_id]
+        github.put_file("data/threads.json", threads_doc, "Purge self-test thread", threads_sha)
+        try:
+            _, sample_sha = github.get_text_file(f"data/samples/{thread_id}.json")
+            github.delete_file(f"data/samples/{thread_id}.json", "Purge self-test samples", sample_sha)
+        except Exception:  # noqa: BLE001
+            pass
+        catalog_doc = load_catalog(source)
+        catalog_doc["threads"] = [t for t in catalog_doc.get("threads", []) if str(t.get("id")) != thread_id]
+        put_json(github, "data/thread_catalog.json", catalog_doc, "Purge self-test catalog entry")
+        st.session_state.setdefault("sample_cache", {}).pop(thread_id, None)
+        st.session_state["threads_override"] = threads_doc.get("threads", [])
+        st.session_state["layout_applied"] = [r for r in st.session_state.get("layout_applied", []) if str(r.get("thread_id")) != thread_id]
+        st.session_state["layout_draft"] = [r for r in st.session_state.get("layout_draft", []) if str(r.get("thread_id")) != thread_id]
+        store_session_docs(threads_payload=threads_doc, catalog=catalog_doc)
+
+    def run_isolated_thread_update(thread_id: str, reason: str) -> tuple[bool, str]:
+        tmp_threads = _deepcopy_doc(threads_payload)
+        for thread in tmp_threads.get("threads", []):
+            if str(thread.get("id")) == str(thread_id):
+                thread["status"] = "active"
+                break
+        _, updated_threads_doc, sample_updates, result = run_update(
+            config=_deepcopy_doc(config),
+            threads_payload=tmp_threads,
+            selected_thread_ids={thread_id},
+            set_action=None,
+            log_http=None,
+        )
+        if result.errors:
+            return False, f"update errors: {result.errors}"
+        if thread_id not in sample_updates:
+            return False, "no sample update returned"
+        # Persist only the updated target thread and its samples.
+        real_threads, real_sha = github.get_file("data/threads.json")
+        by_id_new = {str(t.get("id")): t for t in updated_threads_doc.get("threads", [])}
+        for idx, thread in enumerate(real_threads.get("threads", [])):
+            thread_id_cur = str(thread.get("id"))
+            if thread_id_cur in by_id_new:
+                merged = by_id_new[thread_id_cur]
+                for key in [
+                    "last_seen_at",
+                    "last_view_count",
+                    "last_found_page",
+                    "last_found_above",
+                    "last_seen_title",
+                    "current_title",
+                    "current_title_color",
+                    "title_history",
+                    "title_color_map",
+                ]:
+                    if key in merged:
+                        thread[key] = merged.get(key)
+                real_threads["threads"][idx] = thread
+                break
+        github.put_file("data/threads.json", real_threads, f"Self-test update ({reason})", real_sha)
+
+        sample_payload, sample_sha = load_sample_payload(github, {"id": thread_id})
+        sample_payload.setdefault("samples", []).extend(sample_updates[thread_id].get("samples", []))
+        github.put_file(f"data/samples/{thread_id}.json", sample_payload, f"Self-test sample append ({reason})", sample_sha)
+        st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(sample_payload)
+        st.session_state["threads_override"] = real_threads.get("threads", [])
+        store_session_docs(threads_payload=real_threads)
+        return True, "ok"
+
+    def process_selftest_tick() -> None:
+        if selftest_runtime.get("status") != "running":
+            return
+        now = datetime.now(timezone.utc)
+        if selftest_runtime.get("abort_requested"):
+            selftest_runtime["status"] = "aborted"
+            selftest_runtime["stage"] = "aborted"
+            selftest_runtime["run_finished_at"] = utc_now()
+            append_selftest_log(selftest_report, "abort", True, "Self-test aborted by user")
+            persist_selftest_docs()
+            return
+        next_action = parse_iso(selftest_runtime.get("next_action_at"))
+        if next_action and now < next_action:
+            return
+
+        stage = selftest_runtime.get("stage", "init")
+        target_thread_id = str(selftest_runtime.get("thread_id") or selftest_thread_id(selftest_cfg.get("target", {})))
+        if stage == "init":
+            append_selftest_log(selftest_report, "init", True, "Purging previous self-test traces")
+            purge_selftest_traces()
+            target_thread_id = ensure_selftest_entry()
+            selftest_runtime["thread_id"] = target_thread_id
+            selftest_runtime["stage"] = "update_1"
+            selftest_runtime["next_action_at"] = utc_now()
+            persist_selftest_docs()
+            return
+
+        if stage.startswith("update_"):
+            update_no = int(stage.split("_")[1])
+            append_selftest_log(selftest_report, f"update_{update_no}", True, f"Attempting retrieval {update_no}")
+            ok, info = run_isolated_thread_update(target_thread_id, f"selftest_{update_no}")
+            if not ok:
+                selftest_runtime["repair_attempts"] = int(selftest_runtime.get("repair_attempts", 0)) + 1
+                append_selftest_log(selftest_report, f"update_{update_no}", False, info)
+                if int(selftest_runtime.get("repair_attempts", 0)) <= int(selftest_cfg.get("max_repair_attempts", 2)):
+                    append_selftest_log(selftest_report, "diagnostic", True, "Applying remedy: re-ensure self-test thread entry")
+                    ensure_selftest_entry()
+                    selftest_runtime["next_action_at"] = utc_now()
+                    persist_selftest_docs()
+                    return
+                selftest_runtime["status"] = "failed"
+                selftest_runtime["stage"] = "failed"
+                selftest_runtime["last_error"] = info
+                selftest_runtime["run_finished_at"] = utc_now()
+                persist_selftest_docs()
+                return
+
+            try:
+                samples_doc, _ = github.get_file(f"data/samples/{target_thread_id}.json")
+            except Exception:  # noqa: BLE001
+                samples_doc = {"samples": []}
+            count = len(samples_doc.get("samples", []))
+            if count < update_no:
+                append_selftest_log(selftest_report, f"verify_{update_no}", False, "No samples recorded banner condition failed")
+                selftest_runtime["status"] = "failed"
+                selftest_runtime["stage"] = "failed"
+                selftest_runtime["last_error"] = "No samples recorded"
+                selftest_runtime["run_finished_at"] = utc_now()
+                persist_selftest_docs()
+                return
+
+            append_selftest_log(selftest_report, f"verify_{update_no}", True, f"Samples count now {count}")
+            if update_no >= 3:
+                selftest_runtime["status"] = "passed"
+                selftest_runtime["stage"] = "complete"
+                selftest_runtime["last_result"] = "3 updates complete"
+                selftest_runtime["run_finished_at"] = utc_now()
+                persist_selftest_docs()
+                return
+
+            selftest_runtime["stage"] = f"update_{update_no + 1}"
+            selftest_runtime["next_action_at"] = (datetime.now(timezone.utc) + timedelta(seconds=int(selftest_cfg.get("delay_seconds", 4)))).isoformat()
+            persist_selftest_docs()
 
     with side_tabs[3]:
         st.subheader("Display options")
@@ -848,6 +1100,56 @@ def main() -> None:
             global_cfg["enable_process_logging"] = bool(process_logging_new)
             put_json(github, "data/config.json", config, "Update process logging toggle")
             store_session_docs(config=config)
+
+        st.divider()
+        st.subheader("Runtime Self-Test")
+        st.caption("Uses fixed Dodo target (ID 2066634) with three updates, 4s apart.")
+        st.write(f"Self-test status: `{selftest_runtime.get('status', 'idle')}` | stage: `{selftest_runtime.get('stage', 'idle')}`")
+        st_cols = st.columns(3)
+        if st_cols[0].button("Run self-test", disabled=read_only):
+            selftest_report = {"schema_version": 1, "logs": []}
+            selftest_runtime = {
+                "status": "running",
+                "stage": "init",
+                "run_started_at": utc_now(),
+                "run_finished_at": None,
+                "abort_requested": False,
+                "thread_id": None,
+                "next_action_at": utc_now(),
+                "repair_attempts": 0,
+                "last_error": None,
+                "last_result": None,
+            }
+            append_selftest_log(selftest_report, "start", True, "Self-test run initiated")
+            persist_selftest_docs()
+            st.rerun()
+        if st_cols[1].button("Abort self-test", disabled=read_only or selftest_runtime.get("status") != "running"):
+            selftest_runtime["abort_requested"] = True
+            append_selftest_log(selftest_report, "abort_request", True, "Abort requested by user")
+            persist_selftest_docs()
+            st.rerun()
+        if st_cols[2].button("Purge self-test traces", disabled=read_only):
+            purge_selftest_traces()
+            selftest_runtime = {
+                "status": "idle",
+                "stage": "idle",
+                "run_started_at": None,
+                "run_finished_at": None,
+                "abort_requested": False,
+                "thread_id": None,
+                "next_action_at": None,
+                "repair_attempts": 0,
+                "last_error": None,
+                "last_result": None,
+            }
+            selftest_report = {"schema_version": 1, "logs": []}
+            persist_selftest_docs()
+            st.rerun()
+        with st.expander("Self-test report", expanded=False):
+            if selftest_report.get("logs"):
+                st.dataframe(pd.DataFrame(selftest_report.get("logs", [])), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No self-test logs yet")
 
         st.divider()
         interval_new = st.number_input(
@@ -1203,6 +1505,43 @@ def main() -> None:
                 store_session_docs(catalog=catalog, threads_payload=threads_doc)
                 st.session_state["threads_override"] = threads_doc.get("threads", [])
                 st.rerun()
+            if restore_picks and st.button("Re-add selected as fresh", disabled=read_only):
+                threads_doc, sha = github.get_file("data/threads.json")
+                existing_ids = {str(t.get("id")) for t in threads_doc.get("threads", [])}
+                order_start = len(threads_doc.get("threads", []))
+                appended = 0
+                for pick in restore_picks:
+                    old_id = restore_labels[pick]
+                    entry = next((x for x in archived_entries if str(x.get("id")) == old_id), None)
+                    if not entry:
+                        continue
+                    fresh_id = thread_id_for(
+                        f"fresh-{entry.get('thread_numeric_id')}-{entry.get('subforum_key')}-{utc_now()}",
+                        str(entry.get("subforum_key", "restored")),
+                    )
+                    if fresh_id in existing_ids:
+                        continue
+                    threads_doc.setdefault("threads", []).append(
+                        {
+                            "id": fresh_id,
+                            "display_name": entry.get("display_name") or f"Thread {entry.get('thread_numeric_id') or fresh_id}",
+                            "thread_numeric_id": entry.get("thread_numeric_id"),
+                            "subforum_key": entry.get("subforum_key"),
+                            "status": "paused",
+                            "include_in_adhoc": False,
+                            "order": order_start + appended,
+                            "created_at": utc_now(),
+                            "title_history": [],
+                            "title_color_map": {},
+                        }
+                    )
+                    appended += 1
+                github.put_file("data/threads.json", threads_doc, "Re-add selected threads as fresh", sha)
+                catalog = upsert_catalog_entries(catalog, threads_doc.get("threads", []))
+                put_json(github, "data/thread_catalog.json", catalog, "Update thread catalog")
+                store_session_docs(catalog=catalog, threads_payload=threads_doc)
+                st.session_state["threads_override"] = threads_doc.get("threads", [])
+                st.rerun()
 
         st.divider()
         if st.button("Save data and remove all threads", disabled=read_only or not threads_payload.get("threads")):
@@ -1381,6 +1720,8 @@ def main() -> None:
             if downloaded:
                 st.session_state["archive_zip_bytes"] = b""
 
+    process_selftest_tick()
+
     config, threads_payload, runtime, did_run = run_local_update_if_due(github, config, threads_payload, runtime)
     if did_run:
         store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
@@ -1466,6 +1807,9 @@ def main() -> None:
                     if not samples:
                         st.info("No samples recorded")
                         return
+                    last_source = samples[-1].get("source")
+                    if not chart_opts["graph_only"] and last_source:
+                        st.caption(f"Last sample source: {last_source}")
 
                     df = pd.DataFrame(samples)
                     df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
