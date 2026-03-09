@@ -9,6 +9,7 @@ import subprocess
 import time
 import traceback
 import zipfile
+from http.cookies import SimpleCookie
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -25,7 +26,7 @@ except Exception:  # noqa: BLE001
 from ui.data_client import DataSource, fetch_json
 from ui.github_client import GithubClient, GithubConfig
 from ui.models import thread_id_for, utc_now
-from ui.tracker_engine import due_for_run, next_run_timestamp, run_update
+from ui.tracker_engine import check_bladeforums_auth, due_for_run, next_run_timestamp, run_update
 
 
 st.set_page_config(
@@ -209,6 +210,26 @@ def parse_thread_numeric_id(value: str) -> str | None:
         return text
     match = THREAD_ID_INPUT_RE.search(text)
     return match.group(1) if match else None
+
+
+def parse_cookie_secret(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    text = str(raw).strip()
+    if not text:
+        return {}
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, dict):
+            return {str(k): str(v) for k, v in loaded.items() if str(k).strip()}
+    except Exception:  # noqa: BLE001
+        pass
+    cookie = SimpleCookie()
+    try:
+        cookie.load(text)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {key: morsel.value for key, morsel in cookie.items()}
 
 
 def _is_forbidden_error(exc: Exception) -> bool:
@@ -521,6 +542,7 @@ def execute_update(
     runtime: dict[str, Any],
     selected_thread_ids: set[str] | None,
     reason: str,
+    auth_cookies: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     tracker_state = config.get("tracker", {}).get("state", "stopped")
     runtime["current_action"] = "updating" if tracker_state != "paused" else "updating (paused)"
@@ -545,6 +567,7 @@ def execute_update(
         selected_thread_ids=selected_thread_ids,
         set_action=set_action,
         log_http=log_http,
+        auth_cookies=auth_cookies,
     )
 
     by_id = {t["id"]: t for t in threads_payload.get("threads", [])}
@@ -937,6 +960,7 @@ def run_local_update_if_due(
     config: dict[str, Any],
     threads_payload: dict[str, Any],
     runtime: dict[str, Any],
+    auth_cookies: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
     if not github:
         return config, threads_payload, runtime, False
@@ -965,6 +989,7 @@ def run_local_update_if_due(
             runtime,
             selected_thread_ids=None,
             reason="interval",
+            auth_cookies=auth_cookies,
         )
         return config, threads_payload, runtime, True
     except Exception as exc:  # noqa: BLE001
@@ -979,6 +1004,7 @@ def run_local_update_if_due(
 def main() -> None:
     source, github, repo, branch = build_clients()
     read_only = github is None
+    auth_cookies = parse_cookie_secret(get_setting("BF_COOKIES"))
 
     try:
         force_reload = bool(st.session_state.pop("force_reload_docs", False))
@@ -1206,6 +1232,7 @@ def main() -> None:
             max_pages_override=3,
             enable_search_fallback=True,
             should_abort=lambda: bool(selftest_runtime.get("abort_requested")),
+            auth_cookies=auth_cookies,
         )
         if result.errors:
             trace_events.append(
@@ -1451,6 +1478,24 @@ def main() -> None:
         st.caption(f"Tracker repo: {repo} ({branch})")
         render_status(config, runtime)
         st.divider()
+        st.subheader("BladeForums auth")
+        if auth_cookies:
+            st.caption(f"Cookies configured: {len(auth_cookies)}")
+            auth_state = st.session_state.get("bf_auth_state")
+            if auth_state:
+                ok = bool(auth_state.get("ok"))
+                message = str(auth_state.get("message"))
+                (st.success if ok else st.error)(f"Auth check: {message}")
+            if st.button("Test BladeForums auth", disabled=read_only):
+                try:
+                    ok, message = check_bladeforums_auth(auth_cookies=auth_cookies)
+                    st.session_state["bf_auth_state"] = {"ok": ok, "message": message, "ts": utc_now()}
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state["bf_auth_state"] = {"ok": False, "message": str(exc), "ts": utc_now()}
+                st.rerun()
+        else:
+            st.warning("No BF_COOKIES secret configured. Search fallback may fail for guest access.")
+        st.divider()
         interval_seconds = int(tracker_cfg.get("interval_seconds", 1800))
         run_immediately = bool(tracker_cfg.get("start_immediately", True))
         current_running = tracker_cfg.get("state", "paused") == "running"
@@ -1469,6 +1514,7 @@ def main() -> None:
                             runtime,
                             selected_thread_ids=None,
                             reason="toggle_running_immediate",
+                            auth_cookies=auth_cookies,
                         )
                         st.session_state["threads_override"] = threads_payload.get("threads", [])
                 else:
@@ -1585,6 +1631,7 @@ def main() -> None:
                 runtime,
                 selected_thread_ids=selected_ids,
                 reason="adhoc_selected",
+                auth_cookies=auth_cookies,
             )
             st.session_state["threads_override"] = threads_payload.get("threads", [])
             st.rerun()
@@ -1605,6 +1652,7 @@ def main() -> None:
                 runtime,
                 selected_thread_ids=None,
                 reason="adhoc_all_active",
+                auth_cookies=auth_cookies,
             )
             st.session_state["threads_override"] = threads_payload.get("threads", [])
             st.rerun()
@@ -2152,7 +2200,13 @@ def main() -> None:
 
     process_selftest_tick()
 
-    config, threads_payload, runtime, did_run = run_local_update_if_due(github, config, threads_payload, runtime)
+    config, threads_payload, runtime, did_run = run_local_update_if_due(
+        github,
+        config,
+        threads_payload,
+        runtime,
+        auth_cookies=auth_cookies,
+    )
     if did_run:
         store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
 
@@ -2367,6 +2421,7 @@ def main() -> None:
                                 runtime,
                                 selected_thread_ids={thread_id},
                                 reason=f"refresh_thread_{thread_id}",
+                                auth_cookies=auth_cookies,
                             )
                             st.session_state["threads_override"] = threads_payload.get("threads", [])
                             st.rerun()

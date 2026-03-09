@@ -310,6 +310,7 @@ def run_update(
     max_pages_override: int | None = None,
     enable_search_fallback: bool = True,
     should_abort: callable | None = None,
+    auth_cookies: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]], UpdateResult]:
     started_at = utc_now()
     requests_made = 0
@@ -356,6 +357,8 @@ def run_update(
         recent_calls.append(last_call_at)
 
     session = requests.Session()
+    if auth_cookies:
+        session.cookies.update(auth_cookies)
 
     for thread in active_threads:
         if should_abort and should_abort():
@@ -608,3 +611,25 @@ def run_update(
         errors=errors,
     )
     return config, threads_payload, samples_updates, result
+
+
+def check_bladeforums_auth(auth_cookies: dict[str, str] | None = None) -> tuple[bool, str]:
+    session = requests.Session()
+    if auth_cookies:
+        session.cookies.update(auth_cookies)
+    resp = session.get(
+        "https://www.bladeforums.com/search/?type=post",
+        headers=_headers(),
+        timeout=20,
+        allow_redirects=True,
+    )
+    text = resp.text.lower()
+    if resp.status_code >= 400:
+        return False, f"http_{resp.status_code}"
+    if "login" in str(resp.url).lower() and "search" not in str(resp.url).lower():
+        return False, "redirected_to_login"
+    if "search titles only" in text or "search in forums" in text:
+        return True, "authenticated_search_available"
+    if "you must be logged in" in text or "you must be logged-in" in text:
+        return False, "search_requires_login"
+    return False, "auth_status_unknown"
