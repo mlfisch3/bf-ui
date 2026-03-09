@@ -902,12 +902,20 @@ def main() -> None:
             if str(thread.get("id")) == str(thread_id):
                 thread["status"] = "active"
                 break
+        fast_cfg = _deepcopy_doc(config)
+        fast_global = fast_cfg.setdefault("global", {})
+        fast_global["min_delay_seconds"] = 0.0
+        fast_global["max_delay_seconds"] = 0.2
+        fast_global["max_retries"] = 0
         _, updated_threads_doc, sample_updates, result = run_update(
-            config=_deepcopy_doc(config),
+            config=fast_cfg,
             threads_payload=tmp_threads,
             selected_thread_ids={thread_id},
             set_action=None,
             log_http=None,
+            max_pages_override=3,
+            enable_search_fallback=True,
+            should_abort=lambda: bool(selftest_runtime.get("abort_requested")),
         )
         if result.errors:
             return False, f"update errors: {result.errors}"
@@ -977,6 +985,13 @@ def main() -> None:
             append_selftest_log(selftest_report, f"update_{update_no}", True, f"Attempting retrieval {update_no}")
             ok, info = run_isolated_thread_update(target_thread_id, f"selftest_{update_no}")
             if not ok:
+                if "Aborted" in info or "aborted" in info:
+                    selftest_runtime["status"] = "aborted"
+                    selftest_runtime["stage"] = "aborted"
+                    selftest_runtime["run_finished_at"] = utc_now()
+                    append_selftest_log(selftest_report, f"update_{update_no}", False, "Aborted during update step")
+                    persist_selftest_docs()
+                    return
                 selftest_runtime["repair_attempts"] = int(selftest_runtime.get("repair_attempts", 0)) + 1
                 append_selftest_log(selftest_report, f"update_{update_no}", False, info)
                 if int(selftest_runtime.get("repair_attempts", 0)) <= int(selftest_cfg.get("max_repair_attempts", 2)):
@@ -1112,56 +1127,6 @@ def main() -> None:
             global_cfg["enable_process_logging"] = bool(process_logging_new)
             put_json(github, "data/config.json", config, "Update process logging toggle")
             store_session_docs(config=config)
-
-        st.divider()
-        st.subheader("Runtime Self-Test")
-        st.caption("Uses fixed Dodo target (ID 2066634) with three updates, 4s apart.")
-        st.write(f"Self-test status: `{selftest_runtime.get('status', 'idle')}` | stage: `{selftest_runtime.get('stage', 'idle')}`")
-        st_cols = st.columns(3)
-        if st_cols[0].button("Run self-test", disabled=read_only):
-            selftest_report = {"schema_version": 1, "logs": []}
-            selftest_runtime = {
-                "status": "running",
-                "stage": "init",
-                "run_started_at": utc_now(),
-                "run_finished_at": None,
-                "abort_requested": False,
-                "thread_id": None,
-                "next_action_at": utc_now(),
-                "repair_attempts": 0,
-                "last_error": None,
-                "last_result": None,
-            }
-            append_selftest_log(selftest_report, "start", True, "Self-test run initiated")
-            persist_selftest_docs()
-            st.rerun()
-        if st_cols[1].button("Abort self-test", disabled=read_only or selftest_runtime.get("status") != "running"):
-            selftest_runtime["abort_requested"] = True
-            append_selftest_log(selftest_report, "abort_request", True, "Abort requested by user")
-            persist_selftest_docs()
-            st.rerun()
-        if st_cols[2].button("Purge self-test traces", disabled=read_only):
-            purge_selftest_traces()
-            selftest_runtime = {
-                "status": "idle",
-                "stage": "idle",
-                "run_started_at": None,
-                "run_finished_at": None,
-                "abort_requested": False,
-                "thread_id": None,
-                "next_action_at": None,
-                "repair_attempts": 0,
-                "last_error": None,
-                "last_result": None,
-            }
-            selftest_report = {"schema_version": 1, "logs": []}
-            persist_selftest_docs()
-            st.rerun()
-        with st.expander("Self-test report", expanded=False):
-            if selftest_report.get("logs"):
-                st.dataframe(pd.DataFrame(selftest_report.get("logs", [])), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No self-test logs yet")
 
         st.divider()
         interval_new = st.number_input(
@@ -1738,7 +1703,7 @@ def main() -> None:
     if did_run:
         store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
 
-    main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events"])
+    main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events", "Self-Test"])
 
     def mutate_threads(mutator: callable, message: str) -> None:
         threads_doc, sha = github.get_file("data/threads.json")
@@ -2010,6 +1975,69 @@ def main() -> None:
                 st.dataframe(events_df[["ts", "level", "message"]], use_container_width=True, hide_index=True)
             else:
                 st.caption("No runtime events yet")
+
+    with main_tabs[3]:
+        st.subheader("Runtime Self-Test")
+        st.caption("Runs on fixed target: Dodo thread ID 2066634. Executes 3 retrievals with 4-second spacing.")
+        st.write(
+            f"Status: `{selftest_runtime.get('status', 'idle')}` | Stage: `{selftest_runtime.get('stage', 'idle')}` | "
+            f"Repair attempts: `{selftest_runtime.get('repair_attempts', 0)}`"
+        )
+        st.write(
+            f"Started: `{to_ny_24h(selftest_runtime.get('run_started_at'))}` | "
+            f"Finished: `{to_ny_24h(selftest_runtime.get('run_finished_at'))}`"
+        )
+        cst = st.columns(3)
+        if cst[0].button("Run self-test", disabled=read_only):
+            selftest_report = {"schema_version": 1, "logs": []}
+            selftest_runtime = {
+                "status": "running",
+                "stage": "init",
+                "run_started_at": utc_now(),
+                "run_finished_at": None,
+                "abort_requested": False,
+                "thread_id": None,
+                "next_action_at": utc_now(),
+                "repair_attempts": 0,
+                "last_error": None,
+                "last_result": None,
+            }
+            append_selftest_log(selftest_report, "start", True, "Self-test run initiated")
+            persist_selftest_docs()
+            st.rerun()
+        if cst[1].button("Abort self-test", disabled=read_only or selftest_runtime.get("status") != "running"):
+            selftest_runtime["abort_requested"] = True
+            append_selftest_log(selftest_report, "abort_request", True, "Abort requested by user")
+            persist_selftest_docs()
+            st.rerun()
+        if cst[2].button("Purge self-test traces", disabled=read_only):
+            purge_selftest_traces()
+            selftest_runtime = {
+                "status": "idle",
+                "stage": "idle",
+                "run_started_at": None,
+                "run_finished_at": None,
+                "abort_requested": False,
+                "thread_id": None,
+                "next_action_at": None,
+                "repair_attempts": 0,
+                "last_error": None,
+                "last_result": None,
+            }
+            selftest_report = {"schema_version": 1, "logs": []}
+            persist_selftest_docs()
+            st.rerun()
+
+        st.markdown("**Self-Test Console (verbose)**")
+        logs = selftest_report.get("logs", [])
+        if logs:
+            lines = [
+                f"{item.get('ts')} | {'OK' if item.get('ok') else 'FAIL'} | {item.get('action')} | {item.get('details')}"
+                for item in logs[-300:]
+            ]
+            st.code("\n".join(lines), language="text")
+        else:
+            st.caption("No self-test logs yet")
 
 
 if __name__ == "__main__":

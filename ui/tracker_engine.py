@@ -268,6 +268,9 @@ def run_update(
     selected_thread_ids: set[str] | None = None,
     set_action: callable | None = None,
     log_http: callable | None = None,
+    max_pages_override: int | None = None,
+    enable_search_fallback: bool = True,
+    should_abort: callable | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]], UpdateResult]:
     started_at = utc_now()
     requests_made = 0
@@ -316,6 +319,9 @@ def run_update(
     session = requests.Session()
 
     for thread in active_threads:
+        if should_abort and should_abort():
+            errors.append({"subforum_key": "selftest", "error": "Aborted"})
+            break
         subforum_key = str(thread.get("subforum_key"))
         subforum = subforums.get(subforum_key)
         if not subforum:
@@ -326,10 +332,13 @@ def run_update(
             continue
 
         numeric_id = str(thread.get("thread_numeric_id"))
-        max_pages = SEQUENTIAL_PAGE_DEPTH
+        max_pages = int(max_pages_override) if max_pages_override and max_pages_override > 0 else SEQUENTIAL_PAGE_DEPTH
         found = False
 
         for page in range(1, max_pages + 1):
+            if should_abort and should_abort():
+                errors.append({"subforum_key": subforum_key, "error": "Aborted"})
+                break
             subforum_pages = page_cache.setdefault(subforum_key, {})
             by_id = subforum_pages.get(page)
             if by_id is None:
@@ -338,6 +347,9 @@ def run_update(
                 url = build_page_url(subforum["url"], page)
                 html = None
                 for attempt in range(max_retries + 1):
+                    if should_abort and should_abort():
+                        errors.append({"subforum_key": subforum_key, "error": "Aborted"})
+                        break
                     try:
                         wait_budget()
                         requests_made += 1
@@ -436,6 +448,9 @@ def run_update(
             found = True
             break
         if found:
+            continue
+
+        if not enable_search_fallback:
             continue
 
         forum_node_id = extract_forum_node_id(subforum.get("url"))
