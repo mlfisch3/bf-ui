@@ -38,9 +38,10 @@ st.markdown(
     """
 <style>
 .history-table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
-  table-layout: fixed;
+  table-layout: auto;
 }
 .history-table th, .history-table td {
   border: 1px solid #d7d7d7;
@@ -50,9 +51,15 @@ st.markdown(
 }
 .history-table th {
   white-space: normal;
-  word-break: break-word;
-  line-height: 0.88rem;
+  overflow-wrap: anywhere;
+  line-height: 1rem;
   vertical-align: bottom;
+  min-width: 7.5rem;
+  max-width: 12rem;
+}
+.history-wrap {
+  width: 100%;
+  overflow-x: auto;
 }
 .history-table td.ts-col {
   text-align: left;
@@ -668,7 +675,7 @@ def render_history_html(df: pd.DataFrame, color_lookup: dict[tuple[str, str], st
         html.append("</tr>")
 
     html.append("</tbody></table>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+    st.markdown(f"<div class='history-wrap'>{''.join(html)}</div>", unsafe_allow_html=True)
 
 
 def render_title_legend(thread: dict[str, Any]) -> None:
@@ -789,6 +796,22 @@ DIAG_COMMANDS: dict[str, list[str]] = {
     "find_top": ["find", "/mount/src", "-maxdepth", "3", "-type", "d"],
 }
 
+CONSOLE_ALLOWED_COMMANDS: dict[str, list[str]] = {
+    "pwd": ["pwd"],
+    "ls": ["ls"],
+    "ls -la": ["ls", "-la"],
+    "ls /tmp": ["ls", "/tmp"],
+    "ls -la /tmp": ["ls", "-la", "/tmp"],
+    "ls /mount/src": ["ls", "/mount/src"],
+    "ls -la /mount/src": ["ls", "-la", "/mount/src"],
+    "ls -la /mount/src/bf-ui": ["ls", "-la", "/mount/src/bf-ui"],
+    "ls -la /mount/src/bf-tracker": ["ls", "-la", "/mount/src/bf-tracker"],
+    "find . -maxdepth 3 -type f": ["find", ".", "-maxdepth", "3", "-type", "f"],
+    "find /tmp -maxdepth 3 -type f": ["find", "/tmp", "-maxdepth", "3", "-type", "f"],
+    "ps -ef": ["ps", "-ef"],
+    "env": ["env"],
+}
+
 
 def collect_tree(root: str, max_depth: int = 3, max_entries: int = 500) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -824,6 +847,49 @@ def append_diagnostics_event(diag: dict[str, Any], event: dict[str, Any]) -> dic
     diag.setdefault("events", []).append(event)
     diag["events"] = diag["events"][-300:]
     return diag
+
+
+def query_flag(name: str) -> bool:
+    try:
+        raw = st.query_params.get(name)
+    except Exception:  # noqa: BLE001
+        return False
+    if isinstance(raw, list):
+        value = raw[0] if raw else ""
+    else:
+        value = raw
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_console_command(raw: str) -> tuple[list[str] | None, str | None]:
+    text = " ".join((raw or "").strip().split())
+    if not text:
+        return None, "Enter a command"
+    if text in CONSOLE_ALLOWED_COMMANDS:
+        return CONSOLE_ALLOWED_COMMANDS[text], None
+    if text.startswith("cat "):
+        name = text[4:].strip()
+        if not name or os.path.basename(name) != name:
+            return None, "Only file names in the app working directory are allowed"
+        path = os.path.join(os.getcwd(), name)
+        if not os.path.isfile(path):
+            return None, f"File not found in working directory: {name}"
+        return ["cat", path], None
+    if text.startswith("head -n "):
+        parts = text.split(" ", 3)
+        if len(parts) != 4:
+            return None, "Use format: head -n <count> <filename>"
+        count = parts[2]
+        name = parts[3].strip()
+        if not count.isdigit():
+            return None, "head count must be a positive integer"
+        if not name or os.path.basename(name) != name:
+            return None, "Only file names in the app working directory are allowed"
+        path = os.path.join(os.getcwd(), name)
+        if not os.path.isfile(path):
+            return None, f"File not found in working directory: {name}"
+        return ["head", "-n", count, path], None
+    return None, "Command is not allowed"
 
 
 def run_local_update_if_due(
@@ -921,7 +987,12 @@ def main() -> None:
     st.session_state["tracker_draft"] = sync_tracker_rows(threads_sorted, st.session_state.get("tracker_draft"))
 
     st.sidebar.header("Controls")
-    side_tabs = st.sidebar.tabs(["Tracker", "Threads", "Layout", "Display", "Stats", "Export"])
+    show_console_tab = query_flag("console")
+    side_tab_names = ["Tracker", "Threads", "Layout", "Display", "Stats", "Export"]
+    if show_console_tab:
+        side_tab_names.append("Console")
+    side_tabs = st.sidebar.tabs(side_tab_names)
+    side_tab_map = {name: side_tabs[idx] for idx, name in enumerate(side_tab_names)}
 
     def hard_delete_thread(thread_id: str) -> None:
         threads_doc, threads_sha = github.get_file("data/threads.json")
@@ -1283,7 +1354,7 @@ def main() -> None:
             selftest_runtime["next_action_at"] = (datetime.now(timezone.utc) + timedelta(seconds=int(selftest_cfg.get("delay_seconds", 4)))).isoformat()
             persist_selftest_docs()
 
-    with side_tabs[3]:
+    with side_tab_map["Display"]:
         st.subheader("Display options")
         style = st.selectbox("Trace style", ["lines", "lines+markers", "markers"], index=1, key="disp_mode")
         line_shape = st.selectbox("Line shape", ["linear", "spline"], index=0, key="disp_line_shape")
@@ -1328,7 +1399,7 @@ def main() -> None:
             "auto_fit_mobile": auto_fit_mobile,
         }
 
-    with side_tabs[0]:
+    with side_tab_map["Tracker"]:
         st.subheader("BladeForums View Tracker")
         st.caption(f"Tracker repo: {repo} ({branch})")
         render_status(config, runtime)
@@ -1491,7 +1562,7 @@ def main() -> None:
             st.session_state["threads_override"] = threads_payload.get("threads", [])
             st.rerun()
 
-    with side_tabs[1]:
+    with side_tab_map["Threads"]:
         st.subheader("Add thread")
         st.caption("Paste a thread URL or numeric ID. The numeric ID is extracted automatically.")
         with st.form("add_thread_form"):
@@ -1797,7 +1868,7 @@ def main() -> None:
             store_session_docs(threads_payload=threads_doc, catalog=catalog)
             st.rerun()
 
-    with side_tabs[2]:
+    with side_tab_map["Layout"]:
         st.subheader("Thread Cards Layout")
         threads_for_layout = sorted_threads(threads_payload)
         thread_map = {str(t["id"]): t for t in threads_for_layout}
@@ -1862,7 +1933,7 @@ def main() -> None:
                 st.session_state["layout_applied"] = _deepcopy_doc(updated_layout_rows)
                 st.rerun()
 
-    with side_tabs[4]:
+    with side_tab_map["Stats"]:
         st.subheader("Thread update counts")
         stats_rows = []
         for thread in sorted_threads(threads_payload):
@@ -1878,7 +1949,7 @@ def main() -> None:
         else:
             st.caption("No thread data yet")
 
-    with side_tabs[5]:
+    with side_tab_map["Export"]:
         st.subheader("Export")
         export_threads = []
         for thread in sorted_threads(threads_payload):
@@ -1948,6 +2019,84 @@ def main() -> None:
             )
             if downloaded:
                 st.session_state["archive_zip_bytes"] = b""
+
+    if show_console_tab:
+        with side_tab_map["Console"]:
+            st.subheader("Diagnostics Console")
+            st.caption("Allowlisted commands only. Output is capped and timed out for safety.")
+            st.code(f"pwd: {os.getcwd()}", language="text")
+            st.caption("Allowed examples: pwd, ls -la, find . -maxdepth 3 -type f, cat <filename>, head -n 40 <filename>")
+            cmd_text = st.text_input("Command", key="console_cmd_input")
+            if st.button("Run command", key="console_run_btn", disabled=read_only):
+                cmd, err = resolve_console_command(cmd_text)
+                if err:
+                    st.session_state["console_last_output"] = f"ERROR: {err}"
+                elif cmd is None:
+                    st.session_state["console_last_output"] = "ERROR: Missing command"
+                else:
+                    started = utc_now()
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+                        stdout = proc.stdout[-12000:]
+                        stderr = proc.stderr[-6000:]
+                        output = (
+                            f"ts={started}\ncmd={' '.join(cmd)}\nexit_code={proc.returncode}\n\n"
+                            f"=== STDOUT ===\n{stdout}\n\n=== STDERR ===\n{stderr}\n"
+                        )
+                        st.session_state["console_last_output"] = output
+                        append_diagnostics_event(
+                            diagnostics,
+                            {
+                                "ts": utc_now(),
+                                "type": "console_command",
+                                "ok": proc.returncode == 0,
+                                "cmd": cmd,
+                                "exit_code": proc.returncode,
+                            },
+                        )
+                        persist_diagnostics_docs()
+                    except Exception as exc:  # noqa: BLE001
+                        st.session_state["console_last_output"] = f"ERROR: {exc}"
+                        append_diagnostics_event(
+                            diagnostics,
+                            {
+                                "ts": utc_now(),
+                                "type": "console_command",
+                                "ok": False,
+                                "cmd": cmd,
+                                "error": str(exc),
+                            },
+                        )
+                        persist_diagnostics_docs()
+            st.text_area(
+                "Output",
+                value=str(st.session_state.get("console_last_output", "")),
+                height=280,
+                disabled=True,
+                key="console_output_area",
+            )
+
+            st.divider()
+            st.caption("Download file from current working directory")
+            file_name = st.text_input("File name in pwd", key="console_download_name")
+            if file_name and os.path.basename(file_name) == file_name:
+                candidate = os.path.join(os.getcwd(), file_name)
+                if os.path.isfile(candidate):
+                    try:
+                        with open(candidate, "rb") as handle:
+                            file_data = handle.read()
+                        st.download_button(
+                            "Download file",
+                            data=file_data,
+                            file_name=file_name,
+                            key="console_download_btn",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.caption(f"Unable to read file: {exc}")
+                else:
+                    st.caption("File not found in working directory")
+            elif file_name:
+                st.caption("Enter only a file name (no path)")
 
     process_selftest_tick()
 
@@ -2218,15 +2367,15 @@ def main() -> None:
         render_history_html(history_df, color_lookup)
 
     with main_tabs[2]:
-        with st.expander("Runtime Events", expanded=False):
-            events = runtime.get("events", [])
-            if events:
-                events_df = pd.DataFrame(events[-80:])
-                events_df["ts"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
-                events_df["ts"] = events_df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                st.dataframe(events_df[["ts", "level", "message"]], use_container_width=True, hide_index=True)
-            else:
-                st.caption("No runtime events yet")
+        events = runtime.get("events", [])
+        if events:
+            recent_events = list(reversed(events))[:200]
+            events_df = pd.DataFrame(recent_events)
+            events_df["ts"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
+            events_df["ts"] = events_df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(events_df[["ts", "level", "message"]], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No runtime events yet")
 
     with main_tabs[3]:
         st.subheader("Runtime Self-Test")
@@ -2394,7 +2543,8 @@ def main() -> None:
         st.markdown("**Recent Diagnostics Events**")
         events = diagnostics.get("events", [])
         if events:
-            st.dataframe(pd.DataFrame(events[-50:]), use_container_width=True, hide_index=True)
+            recent_diag = list(reversed(events))[:100]
+            st.dataframe(pd.DataFrame(recent_diag), use_container_width=True, hide_index=True)
             st.download_button(
                 "Download diagnostics events",
                 data=json.dumps(diagnostics, indent=2),
