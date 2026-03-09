@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import platform
 import re
+import subprocess
 import time
 import traceback
 import zipfile
@@ -779,6 +781,51 @@ def summarize_selftest_failure(logs: list[dict[str, Any]]) -> dict[str, Any] | N
     return None
 
 
+DIAG_COMMANDS: dict[str, list[str]] = {
+    "pwd": ["pwd"],
+    "ls_root": ["ls", "-la", "/mount/src"],
+    "ls_app": ["ls", "-la", "/mount/src/bf-ui"],
+    "ls_tracker_data": ["ls", "-la", "/mount/src/bf-tracker/data"],
+    "find_top": ["find", "/mount/src", "-maxdepth", "3", "-type", "d"],
+}
+
+
+def collect_tree(root: str, max_depth: int = 3, max_entries: int = 500) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        rows.append({"type": "dir", "path": dirpath, "depth": depth})
+        for name in sorted(filenames):
+            fpath = os.path.join(dirpath, name)
+            try:
+                size = os.path.getsize(fpath)
+            except OSError:
+                size = None
+            rows.append({"type": "file", "path": fpath, "depth": depth + 1, "size": size})
+            if len(rows) >= max_entries:
+                return rows
+        if len(rows) >= max_entries:
+            return rows
+    return rows
+
+
+def load_diagnostics(source: DataSource) -> dict[str, Any]:
+    payload = fetch_or_default(source, "data/diagnostics.json", {"schema_version": 1, "events": []})
+    payload.setdefault("events", [])
+    return payload
+
+
+def append_diagnostics_event(diag: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    diag.setdefault("events", []).append(event)
+    diag["events"] = diag["events"][-300:]
+    return diag
+
+
 def run_local_update_if_due(
     github: GithubClient | None,
     config: dict[str, Any],
@@ -823,6 +870,7 @@ def main() -> None:
         selftest_cfg = load_selftest_config(source)
         selftest_runtime = load_selftest_runtime(source)
         selftest_report = load_selftest_report(source)
+        diagnostics = load_diagnostics(source)
     except Exception as exc:  # noqa: BLE001
         if github:
             try:
@@ -915,6 +963,9 @@ def main() -> None:
             ("\n".join(text_lines) + ("\n" if text_lines else "")),
             "Update self-test verbose log",
         )
+
+    def persist_diagnostics_docs() -> None:
+        put_json(github, "data/diagnostics.json", diagnostics, "Update diagnostics events")
 
     def ensure_selftest_entry() -> str:
         target = selftest_cfg.get("target", {})
@@ -1872,6 +1923,9 @@ def main() -> None:
                 zf.writestr("data/runtime.json", json.dumps(runtime, indent=2))
                 zf.writestr("data/threads.json", json.dumps(threads_payload, indent=2))
                 zf.writestr("data/thread_catalog.json", json.dumps(catalog, indent=2))
+                zf.writestr("data/selftest_runtime.json", json.dumps(selftest_runtime, indent=2))
+                zf.writestr("data/selftest_report.json", json.dumps(selftest_report, indent=2))
+                zf.writestr("data/diagnostics.json", json.dumps(diagnostics, indent=2))
                 thread_ids = {str(t.get("id")) for t in threads_payload.get("threads", []) if t.get("id")}
                 thread_ids.update({str(t.get("id")) for t in catalog.get("threads", []) if t.get("id")})
                 for thread_id in sorted(thread_ids):
@@ -1901,7 +1955,7 @@ def main() -> None:
     if did_run:
         store_session_docs(config=config, threads_payload=threads_payload, runtime=runtime)
 
-    main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events", "Self-Test"])
+    main_tabs = st.tabs(["Thread Cards", "History Table", "Runtime Events", "Self-Test", "Diagnostics"])
 
     def mutate_threads(mutator: callable, message: str) -> None:
         threads_doc, sha = github.get_file("data/threads.json")
@@ -2260,6 +2314,96 @@ def main() -> None:
             )
         else:
             st.caption("No self-test logs yet")
+
+    with main_tabs[4]:
+        st.subheader("Diagnostics")
+        st.caption("Safe diagnostics capture for server-side visibility (allowlisted commands only).")
+        d1, d2 = st.columns([1, 2])
+        if d1.button("Capture diagnostics snapshot", disabled=read_only):
+            snapshot = {
+                "ts": utc_now(),
+                "cwd": os.getcwd(),
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "tree": collect_tree("/mount/src", max_depth=3, max_entries=600),
+                "runtime_state": {
+                    "tracker_state": config.get("tracker", {}).get("state"),
+                    "current_action": runtime.get("current_action"),
+                    "selftest_status": selftest_runtime.get("status"),
+                    "selftest_stage": selftest_runtime.get("stage"),
+                },
+            }
+            snap_name = f"data/diagnostics/snapshot_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}.json"
+            put_json(github, snap_name, snapshot, "Add diagnostics snapshot")
+            append_diagnostics_event(
+                diagnostics,
+                {
+                    "ts": utc_now(),
+                    "type": "snapshot",
+                    "ok": True,
+                    "path": snap_name,
+                    "details": "Diagnostics snapshot captured",
+                },
+            )
+            persist_diagnostics_docs()
+            st.success(f"Captured snapshot: {snap_name}")
+
+        cmd_key = d2.selectbox("Allowlisted command", options=list(DIAG_COMMANDS.keys()), key="diag_cmd_key")
+        if st.button("Run diagnostics command", disabled=read_only):
+            cmd = DIAG_COMMANDS[cmd_key]
+            started = utc_now()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+                payload = (
+                    f"ts={started}\ncmd={' '.join(cmd)}\nexit_code={proc.returncode}\n\n"
+                    f"=== STDOUT ===\n{proc.stdout}\n\n=== STDERR ===\n{proc.stderr}\n"
+                )
+                tmp_path = f"/tmp/bf_diag_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}_{cmd_key}.log"
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                repo_path = f"data/diagnostics/command_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}_{cmd_key}.log"
+                put_text(github, repo_path, payload, "Add diagnostics command output")
+                append_diagnostics_event(
+                    diagnostics,
+                    {
+                        "ts": utc_now(),
+                        "type": "command",
+                        "ok": proc.returncode == 0,
+                        "path": repo_path,
+                        "tmp_path": tmp_path,
+                        "cmd": cmd,
+                        "exit_code": proc.returncode,
+                    },
+                )
+                persist_diagnostics_docs()
+                st.success(f"Saved command output to {repo_path}")
+            except Exception as exc:  # noqa: BLE001
+                append_diagnostics_event(
+                    diagnostics,
+                    {
+                        "ts": utc_now(),
+                        "type": "command",
+                        "ok": False,
+                        "cmd": cmd,
+                        "error": str(exc),
+                    },
+                )
+                persist_diagnostics_docs()
+                st.error(f"Command failed: {exc}")
+
+        st.markdown("**Recent Diagnostics Events**")
+        events = diagnostics.get("events", [])
+        if events:
+            st.dataframe(pd.DataFrame(events[-50:]), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download diagnostics events",
+                data=json.dumps(diagnostics, indent=2),
+                file_name=f"diagnostics_events_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                key="download_diagnostics_events",
+            )
+        else:
+            st.caption("No diagnostics events yet")
 
 
 if __name__ == "__main__":
