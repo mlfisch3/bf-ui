@@ -211,7 +211,17 @@ def parse_thread_numeric_id(value: str) -> str | None:
     return match.group(1) if match else None
 
 
-def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: str) -> None:
+def _is_forbidden_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "403" in text or "Forbidden" in text
+
+
+def _mark_write_forbidden(exc: Exception) -> None:
+    st.session_state["repo_write_forbidden"] = True
+    st.session_state["repo_write_forbidden_error"] = str(exc)
+
+
+def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: str) -> bool:
     attempts = 4
     for attempt in range(attempts):
         try:
@@ -222,18 +232,22 @@ def put_json(github: GithubClient, path: str, payload: dict[str, Any], message: 
             return
         try:
             github.put_file(path, payload, message, sha)
-            return
+            return True
         except Exception as exc:  # noqa: BLE001
+            if _is_forbidden_error(exc):
+                _mark_write_forbidden(exc)
+                return False
             text = str(exc)
             is_conflict = "409" in text or "Conflict" in text
             if not is_conflict or attempt >= attempts - 1:
                 raise
             time.sleep(0.15 * (attempt + 1))
+    return False
 
 
-def append_process_log(github: GithubClient, path: str, records: list[dict[str, Any]], message: str) -> None:
+def append_process_log(github: GithubClient, path: str, records: list[dict[str, Any]], message: str) -> bool:
     if not records:
-        return
+        return True
     chunk = "".join(json.dumps(r, sort_keys=True) + "\n" for r in records)
     attempts = 4
     for attempt in range(attempts):
@@ -244,16 +258,20 @@ def append_process_log(github: GithubClient, path: str, records: list[dict[str, 
         new_text = current_text + chunk
         try:
             github.put_text_file(path, new_text, message, sha)
-            return
+            return True
         except Exception as exc:  # noqa: BLE001
+            if _is_forbidden_error(exc):
+                _mark_write_forbidden(exc)
+                return False
             text = str(exc)
             is_conflict = "409" in text or "Conflict" in text
             if not is_conflict or attempt >= attempts - 1:
                 raise
             time.sleep(0.15 * (attempt + 1))
+    return False
 
 
-def put_text(github: GithubClient, path: str, text_payload: str, message: str) -> None:
+def put_text(github: GithubClient, path: str, text_payload: str, message: str) -> bool:
     attempts = 4
     for attempt in range(attempts):
         try:
@@ -264,13 +282,17 @@ def put_text(github: GithubClient, path: str, text_payload: str, message: str) -
             return
         try:
             github.put_text_file(path, text_payload, message, sha)
-            return
+            return True
         except Exception as exc:  # noqa: BLE001
+            if _is_forbidden_error(exc):
+                _mark_write_forbidden(exc)
+                return False
             text = str(exc)
             is_conflict = "409" in text or "Conflict" in text
             if not is_conflict or attempt >= attempts - 1:
                 raise
             time.sleep(0.15 * (attempt + 1))
+    return False
 
 
 def load_runtime(source: DataSource) -> dict[str, Any]:
@@ -431,9 +453,9 @@ def normalize_threads_defaults(threads_payload: dict[str, Any]) -> bool:
 
 
 def persist_threads_doc(github: GithubClient, threads_payload: dict[str, Any], message: str) -> None:
-    threads_doc, sha = github.get_file("data/threads.json")
+    threads_doc, _ = github.get_file("data/threads.json")
     threads_doc["threads"] = threads_payload.get("threads", [])
-    github.put_file("data/threads.json", threads_doc, message, sha)
+    put_json(github, "data/threads.json", threads_doc, message)
 
 
 def load_sample_payload(github: GithubClient, thread: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -480,11 +502,11 @@ def persist_update_results(
         thread = threads_by_id.get(thread_id)
         if not thread:
             continue
-        payload, sha = load_sample_payload(github, thread)
+        payload, _ = load_sample_payload(github, thread)
         payload.setdefault("samples", []).extend(update_payload.get("samples", []))
         payload["thread_numeric_id"] = thread.get("thread_numeric_id")
         payload["title"] = thread.get("current_title") or thread.get("display_name")
-        github.put_file(f"data/samples/{thread_id}.json", payload, f"Append samples {thread_id}", sha)
+        put_json(github, f"data/samples/{thread_id}.json", payload, f"Append samples {thread_id}")
         st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
 
     runtime["last_run_summary"] = summary
@@ -918,6 +940,8 @@ def run_local_update_if_due(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
     if not github:
         return config, threads_payload, runtime, False
+    if bool(st.session_state.get("repo_write_forbidden", False)):
+        return config, threads_payload, runtime, False
     state = config.get("tracker", {}).get("state", "stopped")
     if state != "running":
         return config, threads_payload, runtime, False
@@ -933,15 +957,23 @@ def run_local_update_if_due(
     if not due_for_run(runtime.get("next_run_at")):
         return config, threads_payload, runtime, False
 
-    config, threads_payload, runtime, _ = execute_update(
-        github,
-        config,
-        threads_payload,
-        runtime,
-        selected_thread_ids=None,
-        reason="interval",
-    )
-    return config, threads_payload, runtime, True
+    try:
+        config, threads_payload, runtime, _ = execute_update(
+            github,
+            config,
+            threads_payload,
+            runtime,
+            selected_thread_ids=None,
+            reason="interval",
+        )
+        return config, threads_payload, runtime, True
+    except Exception as exc:  # noqa: BLE001
+        if _is_forbidden_error(exc):
+            _mark_write_forbidden(exc)
+            runtime["current_action"] = "write blocked (GitHub 403)"
+            append_event(runtime, "error", f"Write blocked: {exc}")
+            return config, threads_payload, runtime, False
+        raise
 
 
 def main() -> None:
@@ -1011,6 +1043,8 @@ def main() -> None:
         side_tab_names.append("Console")
     side_tabs = st.sidebar.tabs(side_tab_names)
     side_tab_map = {name: side_tabs[idx] for idx, name in enumerate(side_tab_names)}
+    if bool(st.session_state.get("repo_write_forbidden", False)):
+        st.sidebar.error(f"Repository writes blocked: {st.session_state.get('repo_write_forbidden_error', 'GitHub 403')}")
 
     def hard_delete_thread(thread_id: str) -> None:
         threads_doc, threads_sha = github.get_file("data/threads.json")
