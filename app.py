@@ -110,6 +110,18 @@ def to_ny_24h(value: str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def get_setting(key: str, default: str | None = None) -> str | None:
     if key in st.secrets:
         return st.secrets.get(key)
