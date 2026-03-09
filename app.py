@@ -751,6 +751,34 @@ def selftest_thread_id(target: dict[str, Any]) -> str:
     )
 
 
+def summarize_selftest_failure(logs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for item in logs:
+        if not bool(item.get("ok", True)):
+            action = str(item.get("action", "unknown"))
+            observed = str(item.get("observed") or item.get("details") or "n/a")
+            remedy = str(item.get("remedy") or "n/a")
+            likely = "unknown"
+            lower = f"{action} {observed}".lower()
+            if "http_response" in lower and "status=403" in lower:
+                likely = "Access blocked by remote site (403)"
+            elif "http_response" in lower and "status=429" in lower:
+                likely = "Rate limiting by remote site (429)"
+            elif "no sample" in lower:
+                likely = "Parsing or persistence path did not produce sample data"
+            elif "search failed" in lower:
+                likely = "Search fallback request failed"
+            elif "fetch failed" in lower:
+                likely = "Sequential page retrieval failed"
+            return {
+                "action": action,
+                "observed": observed,
+                "likely_cause": likely,
+                "suggested_remedy": remedy,
+                "ts": item.get("ts"),
+            }
+    return None
+
+
 def run_local_update_if_due(
     github: GithubClient | None,
     config: dict[str, Any],
@@ -2201,6 +2229,14 @@ def main() -> None:
         st.markdown("**Self-Test Console (verbose)**")
         logs = selftest_report.get("logs", [])
         if logs:
+            failure_summary = summarize_selftest_failure(logs)
+            if failure_summary:
+                st.error(
+                    "First failure summary: "
+                    f"{failure_summary.get('action')} | cause={failure_summary.get('likely_cause')} | "
+                    f"observed={failure_summary.get('observed')}"
+                )
+                st.caption(f"Suggested remedy: {failure_summary.get('suggested_remedy')}")
             last = logs[-1]
             st.caption(
                 f"Current/Latest: {last.get('action')} | expected: {last.get('expected') or 'n/a'} | observed: {last.get('observed') or last.get('details')}"
