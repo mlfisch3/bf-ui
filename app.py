@@ -704,6 +704,19 @@ def choose_dtick_ms(ts_values: pd.Series) -> int | None:
     return None
 
 
+def build_axis_ticks(start_ts: pd.Timestamp, end_ts: pd.Timestamp, count: int = 6) -> tuple[list[pd.Timestamp], list[str]]:
+    start = pd.Timestamp(start_ts)
+    end = pd.Timestamp(end_ts)
+    if end < start:
+        start, end = end, start
+    if start == end:
+        start = start - pd.Timedelta(minutes=2)
+        end = end + pd.Timedelta(minutes=2)
+    tick_vals = list(pd.date_range(start=start, end=end, periods=max(2, count)))
+    tick_text = [ts.strftime("%H:%M\n%Y-%m-%d") for ts in tick_vals]
+    return tick_vals, tick_text
+
+
 def sorted_threads(threads_payload: dict[str, Any]) -> list[dict[str, Any]]:
     threads = threads_payload.get("threads", [])
     return sorted(threads, key=lambda t: (t.get("order", 10_000), t.get("created_at", ""), t.get("id", "")))
@@ -2270,7 +2283,6 @@ def main() -> None:
                                         name="Views",
                                     )
                                 )
-                                dtick_ms = choose_dtick_ms(plot_df["ts"])
                                 fig.update_layout(
                                     height=640,
                                     margin={"l": 10, "r": 10, "t": 45, "b": 115},
@@ -2278,9 +2290,12 @@ def main() -> None:
                                     xaxis_title="Timestamp (America/New_York)",
                                     yaxis_title="Views",
                                 )
+                                tick_vals, tick_text = build_axis_ticks(plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1], count=7)
                                 xaxis_cfg: dict[str, Any] = {
                                     "type": "date",
-                                    "tickformat": "%H:%M\n%Y-%m-%d",
+                                    "tickmode": "array",
+                                    "tickvals": tick_vals,
+                                    "ticktext": tick_text,
                                     "hoverformat": "%Y-%m-%d %H:%M:%S",
                                     "range": [plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1]],
                                     "showticklabels": True,
@@ -2291,11 +2306,8 @@ def main() -> None:
                                     "showline": True,
                                     "linecolor": "#666666",
                                     "linewidth": 1,
-                                    "nticks": 8,
                                     "automargin": True,
                                 }
-                                if dtick_ms is not None:
-                                    xaxis_cfg["dtick"] = dtick_ms
                                 fig.update_xaxes(**xaxis_cfg)
                                 fig.update_yaxes(type=chart_opts["y_scale"])
                                 if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
