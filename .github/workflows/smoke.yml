@@ -1,0 +1,41 @@
+name: Streamlit Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: "Deployed Streamlit app URL"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Run smoke checks
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          ARTIFACT_DIR: smoke_artifacts
+        run: |
+          node scripts/smoke_playwright.mjs
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: smoke_artifacts/
