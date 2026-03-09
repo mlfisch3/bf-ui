@@ -1591,8 +1591,8 @@ def main() -> None:
                                 "display_name": label,
                                 "thread_numeric_id": str(numeric),
                                 "subforum_key": subforum_key,
-                                "status": "paused",
-                                "include_in_adhoc": False,
+                                "status": "active",
+                                "include_in_adhoc": True,
                                 "order": order_val,
                                 "created_at": utc_now(),
                                 "title_history": [],
@@ -2273,17 +2273,25 @@ def main() -> None:
                                 dtick_ms = choose_dtick_ms(plot_df["ts"])
                                 fig.update_layout(
                                     height=640,
-                                    margin={"l": 10, "r": 10, "t": 45, "b": 70},
+                                    margin={"l": 10, "r": 10, "t": 45, "b": 115},
                                     title={"text": current_title, "x": 0.02, "xanchor": "left"},
                                     xaxis_title="Timestamp (America/New_York)",
                                     yaxis_title="Views",
                                 )
                                 xaxis_cfg: dict[str, Any] = {
+                                    "type": "date",
                                     "tickformat": "%H:%M\n%Y-%m-%d",
                                     "hoverformat": "%Y-%m-%d %H:%M:%S",
                                     "range": [plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1]],
                                     "showticklabels": True,
                                     "ticks": "outside",
+                                    "ticklen": 6,
+                                    "tickcolor": "#666666",
+                                    "tickfont": {"size": 11, "color": "#333333"},
+                                    "showline": True,
+                                    "linecolor": "#666666",
+                                    "linewidth": 1,
+                                    "nticks": 8,
                                     "automargin": True,
                                 }
                                 if dtick_ms is not None:
