@@ -50,6 +50,7 @@ st.markdown(
   font-size: 0.72rem;
 }
 .history-table th {
+  text-align: left;
   white-space: normal;
   overflow-wrap: anywhere;
   line-height: 1rem;
@@ -631,7 +632,7 @@ def build_history_table(source: DataSource, threads: list[dict[str, Any]]) -> tu
         thread_id = thread.get("id")
         if not thread_id:
             continue
-        col_name = abbreviate_label(thread.get("display_name") or thread.get("current_title") or thread_id)
+        col_name = str(thread.get("display_name") or thread.get("current_title") or thread_id)
         samples_payload = load_samples(source, thread_id)
         for sample in samples_payload.get("samples", []):
             ts = to_ny_24h(sample.get("ts"))
@@ -1361,25 +1362,21 @@ def main() -> None:
         y_scale = st.selectbox("Y scale", ["linear", "log"], index=0, key="disp_y_scale")
         line_width = st.slider("Line width", min_value=1, max_value=6, value=2, key="disp_line_width")
         marker_size = st.slider("Marker size", min_value=4, max_value=16, value=8, key="disp_marker_size")
-        graph_only = st.toggle("Graph-only thread cards", value=True, key="disp_graph_only")
-        cards_per_row = 3
-        auto_fit_mobile = True
-        if graph_only:
-            cards_per_row = int(
-                st.number_input(
-                    "Graph-only cards per row",
-                    min_value=1,
-                    max_value=6,
-                    value=3,
-                    step=1,
-                    key="disp_cards_per_row",
-                )
+        cards_per_row = int(
+            st.number_input(
+                "Thread cards per row",
+                min_value=1,
+                max_value=6,
+                value=3,
+                step=1,
+                key="disp_cards_per_row",
             )
-            auto_fit_mobile = st.toggle(
-                "Auto-fit cards per row on mobile",
-                value=True,
-                key="disp_auto_fit_mobile",
-            )
+        )
+        auto_fit_mobile = st.toggle(
+            "Auto-fit cards per row on mobile",
+            value=True,
+            key="disp_auto_fit_mobile",
+        )
         auto_y = st.checkbox("Auto Y", value=True, key="disp_auto_y")
         y_min = y_max = None
         if not auto_y:
@@ -1394,7 +1391,6 @@ def main() -> None:
             "marker_size": marker_size,
             "y_min": y_min,
             "y_max": y_max,
-            "graph_only": graph_only,
             "cards_per_row": cards_per_row,
             "auto_fit_mobile": auto_fit_mobile,
         }
@@ -2139,33 +2135,192 @@ def main() -> None:
                 current_color = thread.get("current_title_color", "#111111")
                 status = thread.get("status", "active")
                 with st.container():
-                    controls = st.columns([1, 1, 1, 1])
-                    if controls[0].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
-                        execute_update(
-                            github,
-                            config,
-                            threads_payload,
-                            runtime,
-                            selected_thread_ids={thread_id},
-                            reason=f"refresh_thread_{thread_id}",
-                        )
-                        st.session_state["threads_override"] = threads_payload.get("threads", [])
-                        st.rerun()
-                    if controls[1].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
-                        payload, sha = load_sample_payload(github, thread)
-                        payload["samples"] = []
-                        github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
-                        st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
-                        st.rerun()
-                    if controls[2].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
-                        mutate_threads(
-                            lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
-                            "Remove thread",
-                        )
-                    if controls[3].button("DEL", key=f"hard_remove_{thread_id}", disabled=read_only, help="Hard delete thread + history"):
-                        hard_delete_thread(str(thread_id))
+                    payload = load_samples(source, thread_id)
+                    samples = payload.get("samples", [])
+                    card_tabs = st.tabs(["Graph", "Details"])
+                    with card_tabs[0]:
+                        if not samples:
+                            st.info("No samples recorded")
+                        else:
+                            df = pd.DataFrame(samples)
+                            df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
+                            df = df.dropna(subset=["ts", "views"]).copy()
+                            if df.empty:
+                                st.info("No valid samples")
+                            else:
+                                if "title_color" not in df.columns:
+                                    df["title_color"] = "#1f77b4"
+                                df["title_color"] = df["title_color"].fillna("#1f77b4")
 
-                    if not chart_opts["graph_only"]:
+                                df = df.sort_values("ts").reset_index(drop=True)
+                                initial_upper = df["ts"].iloc[-1]
+                                initial_lower = df["ts"].iloc[0]
+                                layout_row = layout_by_id.get(str(thread_id), {"show_x_range": False})
+                                show_x_range = bool(layout_row.get("show_x_range", False))
+                                if show_x_range:
+                                    range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
+                                    upper_mode = range_cols[0].selectbox(
+                                        "↑",
+                                        options=["Latest", "Manual"],
+                                        index=0,
+                                        key=f"x_upper_mode_{thread_id}",
+                                        help="Upper x bound mode",
+                                    )
+                                    lower_mode = range_cols[1].selectbox(
+                                        "↓",
+                                        options=["Window", "Manual"],
+                                        index=0,
+                                        key=f"x_lower_mode_{thread_id}",
+                                        help="Lower x bound mode",
+                                    )
+                                    window_points = int(
+                                        range_cols[2].number_input(
+                                            "N",
+                                            min_value=1,
+                                            max_value=5000,
+                                            value=25,
+                                            step=1,
+                                            key=f"x_window_points_{thread_id}",
+                                            help="Past points before current upper point",
+                                        )
+                                    )
+
+                                    default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
+                                    default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
+                                    manual_upper_date = range_cols[3].date_input(
+                                        "Upper D",
+                                        value=default_upper_dt.date(),
+                                        key=f"x_upper_date_{thread_id}",
+                                        disabled=upper_mode != "Manual",
+                                    )
+                                    manual_upper_time = range_cols[3].time_input(
+                                        "Upper T",
+                                        value=default_upper_dt.time(),
+                                        key=f"x_upper_time_{thread_id}",
+                                        disabled=upper_mode != "Manual",
+                                    )
+                                    manual_lower_date = range_cols[4].date_input(
+                                        "Lower D",
+                                        value=default_lower_dt.date(),
+                                        key=f"x_lower_date_{thread_id}",
+                                        disabled=lower_mode != "Manual",
+                                    )
+                                    manual_lower_time = range_cols[4].time_input(
+                                        "Lower T",
+                                        value=default_lower_dt.time(),
+                                        key=f"x_lower_time_{thread_id}",
+                                        disabled=lower_mode != "Manual",
+                                    )
+                                    if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
+                                        st.session_state[f"x_upper_mode_{thread_id}"] = "Latest"
+                                        st.session_state[f"x_lower_mode_{thread_id}"] = "Window"
+                                        st.session_state[f"x_window_points_{thread_id}"] = 25
+                                        st.session_state[f"x_upper_date_{thread_id}"] = default_upper_dt.date()
+                                        st.session_state[f"x_upper_time_{thread_id}"] = default_upper_dt.time()
+                                        st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
+                                        st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
+                                        st.rerun()
+                                else:
+                                    upper_mode = "Latest"
+                                    lower_mode = "Window"
+                                    window_points = 25
+                                    default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
+                                    default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
+                                    manual_upper_date = default_upper_dt.date()
+                                    manual_upper_time = default_upper_dt.time()
+                                    manual_lower_date = default_lower_dt.date()
+                                    manual_lower_time = default_lower_dt.time()
+
+                                upper_ts = initial_upper
+                                if upper_mode == "Manual":
+                                    upper_ts = pd.Timestamp(datetime.combine(manual_upper_date, manual_upper_time))
+                                    if upper_ts.tzinfo is None:
+                                        upper_ts = upper_ts.tz_localize(NY_TZ)
+                                    else:
+                                        upper_ts = upper_ts.tz_convert(NY_TZ)
+
+                                df_u = df[df["ts"] <= upper_ts].copy()
+                                if df_u.empty:
+                                    df_u = df.iloc[[0]].copy()
+                                upper_ts = df_u["ts"].iloc[-1]
+
+                                if lower_mode == "Window":
+                                    idx_upper = len(df_u) - 1
+                                    idx_lower = max(0, idx_upper - window_points)
+                                    lower_ts = df_u.iloc[idx_lower]["ts"]
+                                else:
+                                    lower_ts = pd.Timestamp(datetime.combine(manual_lower_date, manual_lower_time))
+                                    if lower_ts.tzinfo is None:
+                                        lower_ts = lower_ts.tz_localize(NY_TZ)
+                                    else:
+                                        lower_ts = lower_ts.tz_convert(NY_TZ)
+
+                                plot_df = df[(df["ts"] >= lower_ts) & (df["ts"] <= upper_ts)].copy()
+                                if plot_df.empty:
+                                    plot_df = df.copy()
+
+                                fig = go.Figure()
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=plot_df["ts"],
+                                        y=plot_df["views"],
+                                        mode=chart_opts["mode"],
+                                        line={"shape": chart_opts["line_shape"], "width": chart_opts["line_width"], "color": "#444444"},
+                                        marker={"size": chart_opts["marker_size"], "color": plot_df["title_color"]},
+                                        name="Views",
+                                    )
+                                )
+                                dtick_ms = choose_dtick_ms(plot_df["ts"])
+                                fig.update_layout(
+                                    height=640,
+                                    margin={"l": 10, "r": 10, "t": 45, "b": 70},
+                                    title={"text": current_title, "x": 0.02, "xanchor": "left"},
+                                    xaxis_title="Timestamp (America/New_York)",
+                                    yaxis_title="Views",
+                                )
+                                xaxis_cfg: dict[str, Any] = {
+                                    "tickformat": "%H:%M\n%Y-%m-%d",
+                                    "hoverformat": "%Y-%m-%d %H:%M:%S",
+                                    "range": [plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1]],
+                                    "showticklabels": True,
+                                    "ticks": "outside",
+                                    "automargin": True,
+                                }
+                                if dtick_ms is not None:
+                                    xaxis_cfg["dtick"] = dtick_ms
+                                fig.update_xaxes(**xaxis_cfg)
+                                fig.update_yaxes(type=chart_opts["y_scale"])
+                                if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
+                                    fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
+                                st.plotly_chart(fig, use_container_width=True)
+
+                    with card_tabs[1]:
+                        controls = st.columns([1, 1, 1, 1])
+                        if controls[0].button("↻", key=f"refresh_{thread_id}", disabled=read_only or not thread.get("thread_numeric_id"), help="Refresh this thread"):
+                            execute_update(
+                                github,
+                                config,
+                                threads_payload,
+                                runtime,
+                                selected_thread_ids={thread_id},
+                                reason=f"refresh_thread_{thread_id}",
+                            )
+                            st.session_state["threads_override"] = threads_payload.get("threads", [])
+                            st.rerun()
+                        if controls[1].button("⟲", key=f"reset_{thread_id}", disabled=read_only, help="Reset thread samples"):
+                            payload, sha = load_sample_payload(github, thread)
+                            payload["samples"] = []
+                            github.put_file(f"data/samples/{thread_id}.json", payload, "Reset thread samples", sha)
+                            st.session_state.setdefault("sample_cache", {})[thread_id] = _deepcopy_doc(payload)
+                            st.rerun()
+                        if controls[2].button("✕", key=f"remove_{thread_id}", disabled=read_only, help="Remove thread"):
+                            mutate_threads(
+                                lambda doc: doc.update({"threads": [t for t in doc.get("threads", []) if t.get("id") != thread_id]}),
+                                "Remove thread",
+                            )
+                        if controls[3].button("DEL", key=f"hard_remove_{thread_id}", disabled=read_only, help="Hard delete thread + history"):
+                            hard_delete_thread(str(thread_id))
+
                         st.write(
                             f"**Current title:** <span style='color:{current_color};'>{current_title}</span>",
                             unsafe_allow_html=True,
@@ -2178,166 +2333,11 @@ def main() -> None:
                                 f"Last location: page {thread.get('last_found_page')} | threads above: {thread.get('last_found_above', 'N/A')}"
                             )
                         st.write(f"Last seen: {to_ny_24h(thread.get('last_seen_at'))}")
+                        if samples:
+                            last_source = samples[-1].get("source")
+                            if last_source:
+                                st.caption(f"Last sample source: {last_source}")
                         render_title_legend(thread)
-
-                    payload = load_samples(source, thread_id)
-                    samples = payload.get("samples", [])
-                    if not samples:
-                        st.info("No samples recorded")
-                        return
-                    last_source = samples[-1].get("source")
-                    if not chart_opts["graph_only"] and last_source:
-                        st.caption(f"Last sample source: {last_source}")
-
-                    df = pd.DataFrame(samples)
-                    df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(NY_TZ)
-                    df = df.dropna(subset=["ts", "views"]).copy()
-                    if df.empty:
-                        st.info("No valid samples")
-                        return
-
-                    if "title_color" not in df.columns:
-                        df["title_color"] = "#1f77b4"
-                    df["title_color"] = df["title_color"].fillna("#1f77b4")
-
-                    df = df.sort_values("ts").reset_index(drop=True)
-                    initial_upper = df["ts"].iloc[-1]
-                    initial_lower = df["ts"].iloc[0]
-                    layout_row = layout_by_id.get(str(thread_id), {"show_x_range": False})
-                    show_x_range = bool(layout_row.get("show_x_range", False))
-                    if show_x_range:
-                        range_cols = st.columns([1.1, 1.1, 1.2, 1.8, 1.8, 1])
-                        upper_mode = range_cols[0].selectbox(
-                            "↑",
-                            options=["Latest", "Manual"],
-                            index=0,
-                            key=f"x_upper_mode_{thread_id}",
-                            help="Upper x bound mode",
-                        )
-                        lower_mode = range_cols[1].selectbox(
-                            "↓",
-                            options=["Window", "Manual"],
-                            index=0,
-                            key=f"x_lower_mode_{thread_id}",
-                            help="Lower x bound mode",
-                        )
-                        window_points = int(
-                            range_cols[2].number_input(
-                                "N",
-                                min_value=1,
-                                max_value=5000,
-                                value=25,
-                                step=1,
-                                key=f"x_window_points_{thread_id}",
-                                help="Past points before current upper point",
-                            )
-                        )
-
-                        default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
-                        default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
-                        manual_upper_date = range_cols[3].date_input(
-                            "Upper D",
-                            value=default_upper_dt.date(),
-                            key=f"x_upper_date_{thread_id}",
-                            disabled=upper_mode != "Manual",
-                        )
-                        manual_upper_time = range_cols[3].time_input(
-                            "Upper T",
-                            value=default_upper_dt.time(),
-                            key=f"x_upper_time_{thread_id}",
-                            disabled=upper_mode != "Manual",
-                        )
-                        manual_lower_date = range_cols[4].date_input(
-                            "Lower D",
-                            value=default_lower_dt.date(),
-                            key=f"x_lower_date_{thread_id}",
-                            disabled=lower_mode != "Manual",
-                        )
-                        manual_lower_time = range_cols[4].time_input(
-                            "Lower T",
-                            value=default_lower_dt.time(),
-                            key=f"x_lower_time_{thread_id}",
-                            disabled=lower_mode != "Manual",
-                        )
-                        if range_cols[5].button("⤢", key=f"x_full_{thread_id}", help="Full range"):
-                            st.session_state[f"x_upper_mode_{thread_id}"] = "Latest"
-                            st.session_state[f"x_lower_mode_{thread_id}"] = "Window"
-                            st.session_state[f"x_window_points_{thread_id}"] = 25
-                            st.session_state[f"x_upper_date_{thread_id}"] = default_upper_dt.date()
-                            st.session_state[f"x_upper_time_{thread_id}"] = default_upper_dt.time()
-                            st.session_state[f"x_lower_date_{thread_id}"] = default_lower_dt.date()
-                            st.session_state[f"x_lower_time_{thread_id}"] = default_lower_dt.time()
-                            st.rerun()
-                    else:
-                        upper_mode = "Latest"
-                        lower_mode = "Window"
-                        window_points = 25
-                        default_upper_dt = initial_upper.to_pydatetime().replace(tzinfo=None)
-                        default_lower_dt = initial_lower.to_pydatetime().replace(tzinfo=None)
-                        manual_upper_date = default_upper_dt.date()
-                        manual_upper_time = default_upper_dt.time()
-                        manual_lower_date = default_lower_dt.date()
-                        manual_lower_time = default_lower_dt.time()
-
-                    upper_ts = initial_upper
-                    if upper_mode == "Manual":
-                        upper_ts = pd.Timestamp(datetime.combine(manual_upper_date, manual_upper_time))
-                        if upper_ts.tzinfo is None:
-                            upper_ts = upper_ts.tz_localize(NY_TZ)
-                        else:
-                            upper_ts = upper_ts.tz_convert(NY_TZ)
-
-                    df_u = df[df["ts"] <= upper_ts].copy()
-                    if df_u.empty:
-                        df_u = df.iloc[[0]].copy()
-                    upper_ts = df_u["ts"].iloc[-1]
-
-                    if lower_mode == "Window":
-                        idx_upper = len(df_u) - 1
-                        idx_lower = max(0, idx_upper - window_points)
-                        lower_ts = df_u.iloc[idx_lower]["ts"]
-                    else:
-                        lower_ts = pd.Timestamp(datetime.combine(manual_lower_date, manual_lower_time))
-                        if lower_ts.tzinfo is None:
-                            lower_ts = lower_ts.tz_localize(NY_TZ)
-                        else:
-                            lower_ts = lower_ts.tz_convert(NY_TZ)
-
-                    plot_df = df[(df["ts"] >= lower_ts) & (df["ts"] <= upper_ts)].copy()
-                    if plot_df.empty:
-                        plot_df = df.copy()
-
-                    fig = go.Figure()
-                    fig.add_trace(
-                        go.Scatter(
-                            x=plot_df["ts"],
-                            y=plot_df["views"],
-                            mode=chart_opts["mode"],
-                            line={"shape": chart_opts["line_shape"], "width": chart_opts["line_width"], "color": "#444444"},
-                            marker={"size": chart_opts["marker_size"], "color": plot_df["title_color"]},
-                            name="Views",
-                        )
-                    )
-                    dtick_ms = choose_dtick_ms(plot_df["ts"])
-                    fig.update_layout(
-                        height=640,
-                        margin={"l": 10, "r": 10, "t": 45, "b": 10},
-                        title={"text": current_title, "x": 0.02, "xanchor": "left"},
-                        xaxis_title="Timestamp (America/New_York)",
-                        yaxis_title="Views",
-                    )
-                    xaxis_cfg: dict[str, Any] = {
-                        "tickformat": "%H:%M\n%Y-%m-%d",
-                        "hoverformat": "%Y-%m-%d %H:%M:%S",
-                        "range": [plot_df["ts"].iloc[0], plot_df["ts"].iloc[-1]],
-                    }
-                    if dtick_ms is not None:
-                        xaxis_cfg["dtick"] = dtick_ms
-                    fig.update_xaxes(**xaxis_cfg)
-                    fig.update_yaxes(type=chart_opts["y_scale"])
-                    if chart_opts["y_min"] is not None or chart_opts["y_max"] is not None:
-                        fig.update_yaxes(range=[chart_opts["y_min"], chart_opts["y_max"]])
-                    st.plotly_chart(fig, use_container_width=True)
 
             threads_by_id = {str(t["id"]): t for t in threads}
             visible_rows = [row for row in layout_applied_rows if row.get("show_card", True) and str(row.get("thread_id")) in threads_by_id]
@@ -2345,22 +2345,18 @@ def main() -> None:
             if not visible_threads:
                 st.info("No thread cards selected in Layout.")
             else:
-                if chart_opts["graph_only"]:
-                    requested = max(1, int(chart_opts.get("cards_per_row", 3)))
-                    per_row = (
-                        effective_cards_per_row(requested)
-                        if bool(chart_opts.get("auto_fit_mobile", True))
-                        else requested
-                    )
-                    for start in range(0, len(visible_threads), per_row):
-                        row_items = visible_threads[start : start + per_row]
-                        cols = st.columns(per_row)
-                        for offset, thread in enumerate(row_items):
-                            with cols[offset]:
-                                render_thread(thread)
-                else:
-                    for thread in visible_threads:
-                        render_thread(thread)
+                requested = max(1, int(chart_opts.get("cards_per_row", 3)))
+                per_row = (
+                    effective_cards_per_row(requested)
+                    if bool(chart_opts.get("auto_fit_mobile", True))
+                    else requested
+                )
+                for start in range(0, len(visible_threads), per_row):
+                    row_items = visible_threads[start : start + per_row]
+                    cols = st.columns(per_row)
+                    for offset, thread in enumerate(row_items):
+                        with cols[offset]:
+                            render_thread(thread)
 
     with main_tabs[1]:
         history_df, color_lookup = build_history_table(source, sorted_threads(threads_payload))
