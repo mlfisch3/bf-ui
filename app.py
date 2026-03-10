@@ -1770,20 +1770,24 @@ def main() -> None:
 
         draft_ids = [row["thread_id"] for row in tracker_draft]
         if sort_items and draft_ids:
-            label_to_id: dict[str, str] = {}
-            for item_id in draft_ids:
-                if item_id not in thread_map:
-                    continue
-                base = thread_label(thread_map[item_id])
-                label = base
-                n = 2
-                while label in label_to_id:
-                    label = f"{base} ({n})"
-                    n += 1
-                label_to_id[label] = item_id
-            sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="threads_sort_panel")
-            ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
-            ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+            try:
+                label_to_id: dict[str, str] = {}
+                for item_id in draft_ids:
+                    if item_id not in thread_map:
+                        continue
+                    base = thread_label(thread_map[item_id])
+                    label = base
+                    n = 2
+                    while label in label_to_id:
+                        label = f"{base} ({n})"
+                        n += 1
+                    label_to_id[label] = item_id
+                sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="threads_sort_panel")
+                ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
+                ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+            except Exception:  # noqa: BLE001
+                ordered_ids = draft_ids
+                st.caption("Drag-and-drop is temporarily unavailable; using fixed order.")
         else:
             ordered_ids = draft_ids
             if not sort_items:
@@ -1979,20 +1983,24 @@ def main() -> None:
 
         draft_ids = [row["thread_id"] for row in layout_draft]
         if sort_items and draft_ids:
-            label_to_id: dict[str, str] = {}
-            for item_id in draft_ids:
-                if item_id not in thread_map:
-                    continue
-                base = thread_label(thread_map[item_id])
-                label = base
-                n = 2
-                while label in label_to_id:
-                    label = f"{base} ({n})"
-                    n += 1
-                label_to_id[label] = item_id
-            sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="layout_sort_panel")
-            ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
-            ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+            try:
+                label_to_id: dict[str, str] = {}
+                for item_id in draft_ids:
+                    if item_id not in thread_map:
+                        continue
+                    base = thread_label(thread_map[item_id])
+                    label = base
+                    n = 2
+                    while label in label_to_id:
+                        label = f"{base} ({n})"
+                        n += 1
+                    label_to_id[label] = item_id
+                sorted_labels = sort_items(list(label_to_id.keys()), direction="vertical", key="layout_sort_panel")
+                ordered_ids = [label_to_id[x] for x in sorted_labels if x in label_to_id]
+                ordered_ids.extend([x for x in draft_ids if x not in ordered_ids])
+            except Exception:  # noqa: BLE001
+                ordered_ids = draft_ids
+                st.caption("Drag-and-drop is temporarily unavailable; using fixed order.")
         else:
             ordered_ids = draft_ids
             if not sort_items:
